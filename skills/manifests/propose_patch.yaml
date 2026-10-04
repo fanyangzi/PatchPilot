@@ -1,0 +1,19 @@
+name: propose_patch
+version: 0.1.0
+inputs:
+- LocationSet
+- ReproductionResult
+outputs:
+- Patch
+preconditions: []
+tools:
+- repo.write
+risk: high
+cost: 1.6
+rollback: worktree_reset
+success_signals:
+- propose_patch_complete
+relevance_keywords:
+- patch
+- repair
+- fix

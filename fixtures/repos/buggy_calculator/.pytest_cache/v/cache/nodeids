@@ -1,0 +1,6 @@
+[
+  "artifacts/debug123/worktree/tests/test_calculator.py::test_divide_regular",
+  "artifacts/debug123/worktree/tests/test_calculator.py::test_divide_zero_is_explicit",
+  "tests/test_calculator.py::test_divide_regular",
+  "tests/test_calculator.py::test_divide_zero_is_explicit"
+]

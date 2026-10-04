@@ -1,0 +1,18 @@
+name: apply_patch_safely
+version: 0.1.0
+inputs:
+- Patch
+outputs:
+- PatchedSnapshot
+preconditions: []
+tools:
+- repo.write
+- git.write
+risk: high
+cost: 1.0
+rollback: worktree_reset
+success_signals:
+- apply_patch_safely_complete
+relevance_keywords:
+- apply
+- patch

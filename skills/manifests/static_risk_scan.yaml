@@ -1,0 +1,18 @@
+name: static_risk_scan
+version: 0.1.0
+inputs:
+- Patch
+outputs:
+- RiskResult
+preconditions: []
+tools:
+- repo.read
+risk: medium
+cost: 0.7
+rollback: none
+success_signals:
+- static_risk_scan_complete
+relevance_keywords:
+- risk
+- security
+- scope

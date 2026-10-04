@@ -1,0 +1,4 @@
+{
+  "artifacts/run_fba216fff1/worktree/tests/test_calculator.py": true,
+  "tests/test_calculator.py::test_divide_zero_is_explicit": true
+}

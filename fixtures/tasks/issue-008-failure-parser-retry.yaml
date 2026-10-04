@@ -1,0 +1,13 @@
+task_id: issue-008-failure-parser-retry
+repo: fixtures/repos/flaky_parser
+commit: 508f534
+issue_title: recover from an incomplete parser candidate
+issue_body: An initial parser candidate may preserve malformed input; classify the regression and rebuild the patch context before retrying.
+scenario: failure
+constraints:
+  language: python
+  test_command: python3 -m pytest -q
+risk_policy:
+  network: false
+  max_runtime_sec: 30
+  allowed_paths: [src/, tests/]

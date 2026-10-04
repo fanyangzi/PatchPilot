@@ -1,0 +1,17 @@
+name: generate_regression_test
+version: 0.1.0
+inputs:
+- ReproductionResult
+outputs:
+- TestPatch
+preconditions: []
+tools:
+- repo.write
+risk: medium
+cost: 1.2
+rollback: worktree_reset
+success_signals:
+- generate_regression_test_complete
+relevance_keywords:
+- regression
+- test

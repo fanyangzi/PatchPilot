@@ -1,0 +1,13 @@
+task_id: issue-005-normal-calculator-message
+repo: fixtures/repos/buggy_calculator
+commit: 162b7b7
+issue_title: divide by zero needs a stable public error
+issue_body: Replace the leaked implementation error with the documented public message and keep regular division unchanged.
+scenario: normal
+constraints:
+  language: python
+  test_command: python3 -m pytest -q
+risk_policy:
+  network: false
+  max_runtime_sec: 30
+  allowed_paths: [src/, tests/]

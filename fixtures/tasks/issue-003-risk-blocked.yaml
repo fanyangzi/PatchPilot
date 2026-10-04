@@ -1,0 +1,13 @@
+task_id: issue-003-risk-blocked
+repo: fixtures/repos/risky_change
+commit: ea28350
+issue_title: update parser behavior
+issue_body: this candidate touches a protected release path and must be reviewed.
+scenario: risk
+constraints:
+  language: python
+  test_command: python3 -m pytest -q
+risk_policy:
+  network: false
+  max_runtime_sec: 30
+  allowed_paths: [src/, tests/]

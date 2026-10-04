@@ -1,0 +1,5 @@
+PatchPilot is an original educational prototype. Third-party software, models,
+and services are identified in competition/ai_open_source/resource_inventory.csv.
+Fixture repositories carry their own permissive license files. The remote model
+endpoint is an external service configured locally through .env.local; no
+credentials are included in this repository.

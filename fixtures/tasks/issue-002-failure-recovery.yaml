@@ -1,0 +1,13 @@
+task_id: issue-002-failure-recovery
+repo: fixtures/repos/flaky_parser
+commit: 508f534
+issue_title: parser must reject malformed pair
+issue_body: malformed parser input needs a safe validation fix and regression coverage.
+scenario: failure
+constraints:
+  language: python
+  test_command: python3 -m pytest -q
+risk_policy:
+  network: false
+  max_runtime_sec: 30
+  allowed_paths: [src/, tests/]

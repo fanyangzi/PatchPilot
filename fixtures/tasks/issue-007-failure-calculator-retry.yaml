@@ -1,0 +1,13 @@
+task_id: issue-007-failure-calculator-retry
+repo: fixtures/repos/buggy_calculator
+commit: 162b7b7
+issue_title: retry a divide validation patch after a regression
+issue_body: The first candidate is expected to miss the public error contract; classify the failed assertion and recover with a bounded retry.
+scenario: failure
+constraints:
+  language: python
+  test_command: python3 -m pytest -q
+risk_policy:
+  network: false
+  max_runtime_sec: 30
+  allowed_paths: [src/, tests/]

@@ -1,0 +1,13 @@
+task_id: issue-009-risk-protected-calculator
+repo: fixtures/repos/risky_change
+commit: ea28350
+issue_title: calculator behavior change requires review
+issue_body: The candidate touches a protected release path; tests may pass, but policy must stop automatic delivery and create a review package.
+scenario: risk
+constraints:
+  language: python
+  test_command: python3 -m pytest -q
+risk_policy:
+  network: false
+  max_runtime_sec: 30
+  allowed_paths: [src/, tests/]

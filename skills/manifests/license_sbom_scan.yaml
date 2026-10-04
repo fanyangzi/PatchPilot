@@ -1,0 +1,18 @@
+name: license_sbom_scan
+version: 0.1.0
+inputs:
+- RepoSnapshot
+outputs:
+- ComplianceResult
+preconditions: []
+tools:
+- repo.read
+risk: low
+cost: 0.6
+rollback: none
+success_signals:
+- license_sbom_scan_complete
+relevance_keywords:
+- license
+- sbom
+- compliance

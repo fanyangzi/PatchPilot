@@ -1,0 +1,18 @@
+name: build_evidence_bundle
+version: 0.1.0
+inputs:
+- Run
+outputs:
+- Artifact
+preconditions: []
+tools:
+- artifact.write
+risk: low
+cost: 0.5
+rollback: worktree_reset
+success_signals:
+- build_evidence_bundle_complete
+relevance_keywords:
+- evidence
+- bundle
+- report

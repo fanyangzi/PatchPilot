@@ -1,0 +1,19 @@
+name: reproduce_pytest_failure
+version: 0.1.0
+inputs:
+- TaskSpec
+- RepoSnapshot
+outputs:
+- ReproductionResult
+preconditions: []
+tools:
+- harness.run
+risk: medium
+cost: 1.0
+rollback: none
+success_signals:
+- reproduce_pytest_failure_complete
+relevance_keywords:
+- reproduce
+- failure
+- test
