@@ -79,7 +79,14 @@ def _decorate(run):
     runtime = (ended or time.time()) - started if started else 0
     repo_label = _repo_label(run.get("repo"), task)
     updated = ended or started
-    return {**run, "id": run["run_id"], "title": task.issue_title if task else run.get("task_id"), "issue_title": task.issue_title if task else None, "repo": repo_label, "commit": task.commit if task else None, "fixture": f"Fixture · {task.scenario}" if task else "local run", "runtime_sec": round(runtime, 3), "duration": f"{runtime:.1f}s", "retry_count": max(0, int(run.get("attempt", 1)) - 1), "confidence": 94 if run.get("conclusion") == "TRUSTED_DELIVERY" else 35, "updated_at": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(updated)) if updated else "", "event_count": len(events)}
+    return {**run, "id": run["run_id"], "title": task.issue_title if task else run.get("task_id"), "issue_title": task.issue_title if task else None, "repo": repo_label, "commit": task.commit if task else None, "fixture": f"Fixture · {task.scenario}" if task else "local run", "runtime_sec": round(runtime, 3), "duration": f"{runtime:.1f}s", "retry_count": max(0, int(run.get("attempt", 1)) - 1), "confidence": 94 if run.get("conclusion") == "TRUSTED_DELIVERY" else 35, "updated_at": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(updated)) if updated else "", "event_count": len(events), "task": _task_payload(task)}
+
+def _task_payload(task):
+    """Review-safe subset of a TaskSpec (no host paths)."""
+    if task is None: return None
+    return {"task_id": task.task_id, "repo": _repo_label(task.repo, task), "issue_title": task.issue_title, "issue_body": task.issue_body, "commit": task.commit, "scenario": task.scenario, "test_command": task.constraints.get("test_command"), "risk_policy": task.risk_policy}
+
+ARTIFACT_PREVIEW_BYTES = 200_000
 
 def _event_payload(e):
     data=e.get("data") or {}
@@ -122,6 +129,37 @@ def get_artifacts(run_id: str):
         filename = Path(a["path"]).name
         out.append({"id":a["artifact_id"],"artifact_id":a["artifact_id"],"type":a["kind"],"kind":a["kind"],"name":filename,"filename":filename,"sha256":a.get("sha256"),"size":a.get("size"),"run_id":run_id,"status":"sealed","detail":a.get("metadata",{}).get("conclusion","")})
     return out
+
+@app.get("/api/runs/{run_id}/artifacts/{artifact_id}/content")
+def get_artifact_content(run_id: str, artifact_id: str):
+    """Text preview of a registered artifact. Only paths recorded in the
+    evidence store and located under ARTIFACT_ROOT are readable."""
+    if not store.get_run(run_id): raise HTTPException(404,"run not found")
+    record = next((a for a in store.list_artifacts(run_id) if a.get("artifact_id") == artifact_id), None)
+    if not record: raise HTTPException(404,"artifact not found")
+    path = Path(record["path"]).resolve()
+    if not path.is_relative_to(ARTIFACT_ROOT.resolve()) or not path.is_file():
+        raise HTTPException(404,"artifact not readable")
+    raw = path.read_bytes()[:ARTIFACT_PREVIEW_BYTES]
+    return {"artifact_id": artifact_id, "name": path.name, "kind": record.get("kind"), "truncated": path.stat().st_size > ARTIFACT_PREVIEW_BYTES, "content": _safe_text(raw.decode("utf-8", errors="replace"))}
+
+@app.get("/api/tasks")
+def list_tasks():
+    out=[]
+    for p in sorted(TASK_ROOT.glob("*.yaml")):
+        try: out.append(_task_payload(engine.load_task(p)))
+        except Exception: continue
+    return out
+
+@app.get("/api/eval/summary")
+def eval_summary():
+    folder = ARTIFACT_ROOT / "eval"
+    summary_path, rows_path = folder / "summary.json", folder / "results.jsonl"
+    if not summary_path.is_file(): raise HTTPException(404,"evaluation has not been run")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    keep = ("task_id","scenario","method","status","first_pass","functional_repair","trusted_delivery","recovery_success","policy_gate_pass","evidence_completeness","attempts")
+    rows = [{k: r.get(k) for k in keep} for r in (json.loads(line) for line in rows_path.read_text(encoding="utf-8").splitlines() if line.strip())] if rows_path.is_file() else []
+    return {**summary, "rows": rows}
 
 @app.post("/api/demo/run")
 def demo_run(body: dict | None = None):
