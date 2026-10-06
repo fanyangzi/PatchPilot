@@ -183,7 +183,7 @@ def get_artifacts(run_id: str):
         # Keep host checkout paths out of the browser/API payload.  The
         # console only needs the artifact filename and its digest metadata.
         filename = Path(a["path"]).name
-        out.append({"id":a["artifact_id"],"artifact_id":a["artifact_id"],"type":a["kind"],"kind":a["kind"],"name":filename,"filename":filename,"sha256":a.get("sha256"),"size":a.get("size"),"run_id":run_id,"status":"sealed","detail":a.get("metadata",{}).get("conclusion","")})
+        out.append({"id":a["artifact_id"],"artifact_id":a["artifact_id"],"type":a["kind"],"kind":a["kind"],"name":filename,"filename":filename,"size":a.get("size"),"run_id":run_id,"status":"sealed","detail":a.get("metadata",{}).get("conclusion","")})
     return out
 
 @app.get("/api/runs/{run_id}/artifacts/{artifact_id}/content")

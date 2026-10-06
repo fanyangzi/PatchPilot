@@ -39,7 +39,7 @@ export function RunPicker({
       <span className="g-entry-kicker"><Icon size={14} />真实运行入口</span>
       <h1 id="run-entry-title">{title}</h1>
       <p>{isInspect
-        ? '仓库体检只展示证据库中已经完成或正在执行的运行，不使用虚构样张。请选择一条记录查看六项检查和哈希链。'
+        ? '仓库体检只展示证据库中已经完成或正在执行的运行，不使用虚构样张。请选择一条记录查看六项检查和执行轨迹。'
         : '策略页展示某次运行实际加载的策略。请选择一条记录，查看它的允许路径、敏感模式和必需检查。'}</p>
     </header>
 

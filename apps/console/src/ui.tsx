@@ -22,7 +22,7 @@ export function useAsync<T>(load: () => Promise<T>, deps: unknown[]) {
   return { ...state, reload };
 }
 
-/** Hash routes: #/inspect, #/policy, #/overview, #/runs/<id>, #/routing/<id>, #/eval */
+/** URL routes: #/inspect, #/policy, #/overview, #/runs/<id>, #/routing/<id>, #/eval */
 export type Route = { page: 'overview' | 'runs' | 'routing' | 'eval' | 'inspect' | 'policy'; id?: string };
 
 function parse(hash: string): Route {

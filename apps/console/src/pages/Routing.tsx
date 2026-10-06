@@ -82,7 +82,7 @@ export function RoutingPage({ runs, selectedId }: { runs: RunRecord[]; selectedI
             <h2>模型规划建议</h2>
           </div>
           {!plan ? <p className="sec-sub">这次运行关闭了远程模型规划，路由完全由规则决定。</p> : <>
-            <p className="sec-sub">由 <code>{plan.data.model}</code> 生成。原始回复不落盘，只保存摘要和哈希 <code>{plan.data.response_hash}</code>。</p>
+            <p className="sec-sub">由 <code>{plan.data.model}</code> 生成。原始回复不落盘，只保存摘要。</p>
             <blockquote className="plan-quote">{plan.data.summary}</blockquote>
             {plan.data.suggested_skills?.length > 0 && <div className="adv-block">
               <h3><Waypoints size={13} /> 建议的技能</h3>

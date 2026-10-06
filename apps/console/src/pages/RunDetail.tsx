@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { CSSProperties } from 'react';
 import {
-  BookOpenCheck, Bug, ChevronDown, ChevronRight, Clock, FileDiff, GitCommitHorizontal, Hash, Lock,
+  BookOpenCheck, Bug, ChevronDown, ChevronRight, Clock, FileDiff, GitCommitHorizontal, Lock,
   MessageSquareQuote, Play, RotateCcw, Route, ScanSearch, ShieldCheck, Timer, TriangleAlert, Wifi,
 } from 'lucide-react';
 import { api, type RunEvent, type RunRecord } from '../api';
@@ -24,7 +24,7 @@ export function RunDetail({ run, fresh }: { run: RunRecord; fresh: boolean }) {
         <h1>{run.title}</h1>
         <dl className="facts">
           <div><dt><GitCommitHorizontal size={11} /> 仓库</dt><dd>{run.repo}</dd></div>
-          <div><dt><Hash size={11} /> 基线 commit</dt><dd><code>{run.commit}</code></dd></div>
+          <div><dt><GitCommitHorizontal size={11} /> 基线 commit</dt><dd><code>{run.commit}</code></dd></div>
           <div><dt><Timer size={11} /> 耗时</dt><dd>{secs(run.runtime_sec)}</dd></div>
           <div><dt><RotateCcw size={11} /> 尝试</dt><dd>{run.attempt} 次</dd></div>
           <div><dt><FileDiff size={11} /> 证据完整度</dt><dd>{pct(run.metrics?.evidence_completeness)}</dd></div>

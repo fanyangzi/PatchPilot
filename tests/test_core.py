@@ -10,7 +10,7 @@ def test_registry_and_router():
     graph=GraphRouter(reg).route(task); assert graph['selected']; assert graph['nodes'][0]['score'] >= graph['nodes'][-1]['score']
 
 def test_policy_and_verifier():
-    task=TaskSpec('x',str(Path(__file__).parent),'x','x',risk_policy={'allowed_paths':['src/'],'network':False})
+    task=TaskSpec('x',str(Path(__file__).parent.parent),'x','x',risk_policy={'allowed_paths':['src/'],'network':False})
     assert PolicyGate().check(reg:=reg_or_skill(),task,['tests/a.py'])[0] is False
 
     # Verifier.verify() signature: (before_output, after_output, target_tests, diff_text, task)

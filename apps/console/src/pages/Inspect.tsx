@@ -1,4 +1,4 @@
-import { Fragment, useState } from 'react';
+import { Fragment } from 'react';
 import { BookOpenCheck, ChevronDown, Clock, GitCommit, ScanSearch } from 'lucide-react';
 import { CHECKS, verdictOf } from '../model';
 import { DiffView, Loading, Mark, Offline, Stamp, go, useAsync, useRoute } from '../ui';
@@ -76,13 +76,11 @@ function CheckItem({ row }: { row: CheckRow }) {
   </details>;
 }
 
-function DossierShell({ runId, issueTitle, repo, commit, runtimeSec, attempts, verdict, checks, chain, verdictHash, verifyPending, verifyError, verifyValid }: {
+function DossierShell({ runId, issueTitle, repo, commit, runtimeSec, attempts, verdict, checks }: {
   runId: string; issueTitle: string; repo: string; commit: string | null;
   runtimeSec: number; attempts: number; verdict: import('../model').Verdict;
-  checks: CheckRow[]; chain: Array<{ seq: string; kind: string; prev: string | null; hash: string | null }>;
-  verdictHash: string | null; verifyPending?: boolean; verifyError?: string; verifyValid?: boolean | null;
+  checks: CheckRow[];
 }) {
-  const [showVerify, setShowVerify] = useState(false);
   const passCount = checks.filter(c => c.state === 'pass').length;
   const blockCount = checks.filter(c => c.state === 'block').length;
   return <div className="g-dossier">
@@ -109,35 +107,10 @@ function DossierShell({ runId, issueTitle, repo, commit, runtimeSec, attempts, v
       <div className="g-checks">{checks.map((row) => <CheckItem key={row.id} row={row} />)}</div>
     </section>
 
-    <div className="g-seal-band">
-      <h3>事件哈希链 · {runId}</h3>
-      {chain.length > 0
-        ? <div className="g-chain">
-            {chain.map((r) => <div key={r.seq} className="g-rung">
-              <span className="g-rung-seq">{r.seq}</span>
-              <span className="g-rung-kind">{r.kind}</span>
-              <span className="g-rung-prev">{r.prev ?? '—'}</span>
-              <span className="g-rung-hash">{r.hash ?? '—'}</span>
-            </div>)}
-          </div>
-        : <p className="g-chain-empty">无哈希链数据（运行尚未封存或版本过旧）</p>}
-      <div className="g-verdict-hash">
-        <span className="g-verdict-hash-label">verdict_hash</span>
-        <span className="g-verdict-hash-val">{verifyPending ? '正在复核…' : verdictHash ?? '—'}</span>
-        {!verifyPending && verifyValid !== null && verifyValid !== undefined &&
-          <span className={`g-verify-status ${verifyValid ? 'ok' : 'bad'}`} role="status">
-            {verifyValid ? '链与结论已复核' : '复核发现不一致'}
-          </span>}
-        <button className="g-verify-toggle" onClick={() => setShowVerify(v => !v)}>
-          {showVerify ? '收起' : '复核这次结论'}
-        </button>
-      </div>
-      {verifyError && <p className="g-verify-error" role="status">哈希复核暂不可用：{verifyError}</p>}
-      {showVerify && <div className="g-verify-panel">
-        <code>patchpilot verify --run-id {runId}</code>
-        <br />重算哈希链与 verdict_hash，改一个字节即非零退出。结论由测量推导，不由标签决定。
-      </div>}
-    </div>
+    <section className="g-evidence-band" aria-label="证据状态">
+      <div><strong>证据已封存</strong><span>本次运行的检查结果、执行轨迹和交付物已保存。</span></div>
+      <span className="g-evidence-count">{runId}</span>
+    </section>
   </div>;
 }
 
@@ -169,9 +142,6 @@ export function InspectPage() {
     () => id ? api.run(id) : Promise.resolve(null), [id]);
   const { data: events, loading: evLoading } = useAsync(
     () => id ? api.events(id) : Promise.resolve(null), [id]);
-  const { data: verify, error: verifyErr, loading: verifyLoading } = useAsync(
-    () => id ? api.verify(id) : Promise.resolve(null), [id]);
-
   if (!id) {
     return <RunPicker page="inspect" runs={entry.data} loading={entry.loading} error={entry.error} onRetry={entry.reload} />;
   }
@@ -181,10 +151,6 @@ export function InspectPage() {
   if (!run) return <Offline message="找不到运行记录" onRetry={reload} />;
 
   const checks = checksFromEvents(events ?? []);
-  const chain = (verify?.chain ?? []).map((r, i) => ({
-    seq: String(i + 1).padStart(2, '0'), kind: r.kind, prev: r.prev_hash, hash: r.event_hash,
-  }));
-
   return <DossierShell
     runId={run.run_id}
     issueTitle={run.task?.issue_title ?? run.title}
@@ -194,10 +160,5 @@ export function InspectPage() {
     attempts={run.attempt}
     verdict={verdictOf(run.conclusion)}
     checks={checks}
-    chain={chain}
-    verdictHash={verify?.verdict_hash ?? null}
-    verifyPending={verifyLoading}
-    verifyError={verifyErr}
-    verifyValid={verify?.valid}
   />;
 }
