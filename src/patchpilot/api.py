@@ -1,8 +1,9 @@
 from __future__ import annotations
-import json, os, platform, re, time
+import json, os, platform, re, time, uuid
 from pathlib import Path
 
 from .domain import TaskSpec
+from .domain.models import Event, Run, compute_event_hash, compute_verdict_hash, stable_hash
 from .evidence import EvidenceStore
 from .orchestrator import PatchPilot
 from .skills import SkillRegistry
@@ -24,7 +25,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 def _task_for(run_id: str):
     data = store.get_run(run_id)
     if not data: return None
-    for p in TASK_ROOT.glob("*.yaml"):
+    for p in list(TASK_ROOT.glob("*.yaml")) + list(TASK_ROOT.glob("**/*.yaml")):
         try:
             task = engine.load_task(p)
             if task.task_id == data.get("task_id"): return task
@@ -92,6 +93,61 @@ def _event_payload(e):
     data=e.get("data") or {}
     safe_data = _safe_value(data)
     return {"event_id":e.get("event_id"), "kind":e.get("event_type"), "stage":e.get("event_type"), "title":_safe_text(e.get("message")), "summary":_safe_text(e.get("message")), "detail":json.dumps(safe_data, ensure_ascii=False)[:1000], "status":e.get("status"), "runtime_sec":None, "artifact_ids":data.get("artifact_ids", []), "data":safe_data, "ts":e.get("ts")}
+
+
+def _policy_payload(run_id: str, run: dict, task=None) -> dict:
+    """Return the policy snapshot recorded for a run.
+
+    A run executes in a disposable worktree, so compiling the policy again from
+    ``task.repo`` after completion is both inaccurate and unsafe.  The policy
+    event is the durable source of truth; the fallback only serves old runs
+    created before policy snapshots were emitted.
+    """
+    events = store.list_events(run_id)
+    event = next((e for e in reversed(events) if e.get("event_type") == "policy"), None)
+    data = (event or {}).get("data") or {}
+    if not data and task is not None:
+        from .policy import compile_policy
+        try:
+            policy = compile_policy(Path(task.repo))
+        except Exception:
+            from .policy.schema import Policy
+            policy = Policy()
+        data = {
+            "source": policy.source,
+            "scope": list(policy.scope),
+            "allowed_paths": list(policy.allowed_paths),
+            "sensitive_patterns": list(policy.sensitive_patterns),
+            "required_checks": list(policy.required_checks),
+            "max_attempts": policy.max_attempts,
+        }
+    source = str(data.get("source") or "default")
+    scope = list(data.get("scope") or ["**/*"])
+    allowed = list(data.get("allowed_paths") or [])
+    sensitive = list(data.get("sensitive_patterns") or [])
+    required = list(data.get("required_checks") or [])
+    max_attempts = int(data.get("max_attempts") or 3)
+    yaml_lines = [
+        f"source: {source}",
+        "scope:", *[f"  - {x}" for x in scope],
+        "allowed_paths:", *([f"  - {x}" for x in allowed] or ["  - <none>"]),
+        "sensitive_patterns:", *([f"  - {x}" for x in sensitive] or ["  - <none>"]),
+        "required_checks:", *([f"  - {x}" for x in required] or ["  - <none>"]),
+        f"max_attempts: {max_attempts}",
+    ]
+    return {
+        "run_id": run_id,
+        "source": source,
+        "scope": scope,
+        "allowed_paths": allowed,
+        "sensitive_patterns": sensitive,
+        "required_checks": required,
+        "max_attempts": max_attempts,
+        "compiled_at": (event or {}).get("ts") or run.get("started_at"),
+        "commit": run.get("metrics", {}).get("commit") or (task.commit if task else None),
+        "repository": _repo_label(task.repo, task) if task else _repo_label(run.get("repo")),
+        "yaml": "\n".join(yaml_lines) + "\n",
+    }
 
 @app.get("/api/health")
 def health(): return {"status":"ok", "service":"patchpilot-api", "version":"0.1.0", "python":platform.python_version(), "skills":len(SkillRegistry().all())}
@@ -172,4 +228,50 @@ def demo_run(body: dict | None = None):
 def create_run(body: dict):
     task_id=body.get("task_id")
     if task_id: return demo_run({"task_id":task_id})
-    raise HTTPException(400,"MVP accepts task_id for fixture runs")
+    repo=body.get("repo")
+    if not repo: raise HTTPException(400,"provide task_id or repo")
+    task=TaskSpec.from_dict({"task_id":f"adhoc_{uuid.uuid4().hex[:8]}","repo":repo,"commit":body.get("commit","HEAD"),"issue_title":body.get("issue_title","Ad-hoc run"),"issue_body":body.get("issue_body",""),"patches":[],"patch_sources":[],"constraints":{"test_command":body.get("test_command","pytest -x -q")},"scenario":"normal"})
+    run=engine.run_task(task); return _decorate(run.to_dict())
+
+@app.get("/api/runs/{run_id}/verify")
+def verify_run(run_id: str):
+    run=store.get_run(run_id)
+    if not run: raise HTTPException(404,"run not found")
+    events=store.list_events(run_id)
+    chain=[]; prev_hash=None; chain_valid=True
+    for e in events:
+        ev=Event(run_id=e.get('run_id',run_id),event_type=e.get('event_type',''),status=e.get('status',''),message=e.get('message',''),data=e.get('data',{}),event_id=e.get('event_id',''),ts=e.get('ts',0.0))
+        expected=compute_event_hash(ev,prev_hash); actual=e.get('event_hash')
+        if e.get('prev_hash') != prev_hash or not actual or expected != actual: chain_valid=False
+        used=actual or expected
+        chain.append({'event_id':e.get('event_id'),'kind':e.get('event_type'),'prev_hash':e.get('prev_hash'),'event_hash':used})
+        prev_hash=used
+    task = _task_for(run_id)
+    metrics = run.get('metrics') or {}
+    stored_verdict = run.get('verdict_hash')
+    verdict_expected = None
+    verdict_valid = None
+    if stored_verdict:
+        checks = metrics.get('checks') or {}
+        patch_sha = metrics.get('patch_sha256') or next(
+            (a.get('sha256', '') for a in store.list_artifacts(run_id) if a.get('kind') == 'patch_diff'),
+            '',
+        )
+        evidence_root = metrics.get('evidence_root_hash') or stable_hash(sorted(e.get('evidence_id') for e in store.list_evidence(run_id)))
+        commit = metrics.get('commit') or (task.commit if task else '')
+        run_obj = Run(run_id=run_id, task_id=run.get('task_id',''), conclusion=run.get('conclusion'), metrics=metrics, attempt=int(run.get('attempt',0)))
+        verdict_expected = compute_verdict_hash(run_obj, checks, run_obj.task_id, commit, patch_sha, evidence_root)
+        verdict_valid = verdict_expected == stored_verdict
+    valid = chain_valid and (verdict_valid is not False)
+    return {
+        'run_id':run_id, 'valid':valid, 'chain_valid':chain_valid,
+        'verdict_hash':stored_verdict, 'verdict_hash_expected':verdict_expected,
+        'verdict_hash_valid':verdict_valid, 'event_count':len(events), 'chain':chain,
+    }
+
+@app.get("/api/runs/{run_id}/policy")
+def get_run_policy(run_id: str):
+    run=store.get_run(run_id)
+    if not run: raise HTTPException(404,"run not found")
+    task=_task_for(run_id)
+    return _policy_payload(run_id, run, task)

@@ -1,0 +1,125 @@
+name: 'PatchPilot Gate'
+description: 'Trusted patch gate for open-source maintainers — runs six checks, builds a hash-chained evidence bundle, and reports a verifiable verdict.'
+
+inputs:
+  task-file:
+    description: 'Path to a task YAML file. If omitted, the action builds one from pr-* inputs.'
+    required: false
+    default: ''
+  pr-repo:
+    description: 'Repository URL (used when task-file is omitted).'
+    required: false
+    default: ''
+  pr-commit:
+    description: 'Commit SHA to gate (used when task-file is omitted).'
+    required: false
+    default: ''
+  pr-issue-title:
+    description: 'Issue or PR title (used when task-file is omitted).'
+    required: false
+    default: ''
+  pr-issue-body:
+    description: 'Issue or PR body text (used when task-file is omitted).'
+    required: false
+    default: ''
+  artifacts-dir:
+    description: 'Directory for evidence artifacts.'
+    required: false
+    default: 'patchpilot-artifacts'
+  python-version:
+    description: 'Python version to install.'
+    required: false
+    default: '3.11'
+
+outputs:
+  verdict:
+    description: 'Gate verdict: TRUSTED_DELIVERY | UNSAFE_DELIVERY | NEEDS_REVIEW | FAILED'
+    value: ${{ steps.gate.outputs.verdict }}
+  run-id:
+    description: 'PatchPilot run ID for later verification.'
+    value: ${{ steps.gate.outputs.run_id }}
+  verdict-hash:
+    description: 'Hash binding the verdict to its evidence chain.'
+    value: ${{ steps.gate.outputs.verdict_hash }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install PatchPilot
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[api]"
+      working-directory: ${{ github.action_path }}
+
+    - name: Build task file (when task-file not provided)
+      shell: bash
+      id: build-task
+      run: |
+        TASK_FILE="${{ inputs.task-file }}"
+        if [ -z "$TASK_FILE" ]; then
+          TASK_FILE="${{ inputs.artifacts-dir }}/adhoc_task.yaml"
+          mkdir -p "${{ inputs.artifacts-dir }}"
+          cat > "$TASK_FILE" <<YAML
+        task_id: "pr_${{ github.run_id }}"
+        repo: "${{ inputs.pr-repo }}"
+        commit: "${{ inputs.pr-commit }}"
+        issue_title: "${{ inputs.pr-issue-title }}"
+        issue_body: |
+          ${{ inputs.pr-issue-body }}
+        constraints:
+          language: python
+        risk_policy:
+          network: false
+          max_runtime_sec: 120
+        YAML
+        fi
+        echo "task_file=$TASK_FILE" >> "$GITHUB_OUTPUT"
+
+    - name: Run gate
+      shell: bash
+      id: gate
+      run: |
+        set +e
+        OUTPUT=$(python -m patchpilot.cli run \
+          --task "${{ steps.build-task.outputs.task_file }}" \
+          --artifacts "${{ inputs.artifacts-dir }}" \
+          --json 2>&1)
+        EXIT_CODE=$?
+        set -e
+
+        VERDICT=$(echo "$OUTPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('conclusion','FAILED'))" 2>/dev/null || echo "FAILED")
+        RUN_ID=$(echo "$OUTPUT"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('run_id',''))"     2>/dev/null || echo "")
+        VH=$(echo "$OUTPUT"      | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('verdict_hash',''))" 2>/dev/null || echo "")
+
+        echo "verdict=$VERDICT"       >> "$GITHUB_OUTPUT"
+        echo "run_id=$RUN_ID"         >> "$GITHUB_OUTPUT"
+        echo "verdict_hash=$VH"       >> "$GITHUB_OUTPUT"
+
+        echo "### PatchPilot Gate" >> "$GITHUB_STEP_SUMMARY"
+        echo ""                    >> "$GITHUB_STEP_SUMMARY"
+        echo "| Field | Value |"   >> "$GITHUB_STEP_SUMMARY"
+        echo "|---|---|"           >> "$GITHUB_STEP_SUMMARY"
+        echo "| Verdict | \`$VERDICT\` |"      >> "$GITHUB_STEP_SUMMARY"
+        echo "| Run ID  | \`$RUN_ID\` |"       >> "$GITHUB_STEP_SUMMARY"
+        echo "| Verdict hash | \`$VH\` |"      >> "$GITHUB_STEP_SUMMARY"
+        echo ""                                >> "$GITHUB_STEP_SUMMARY"
+        echo "To verify independently:"        >> "$GITHUB_STEP_SUMMARY"
+        echo "\`\`\`bash"                       >> "$GITHUB_STEP_SUMMARY"
+        echo "patchpilot verify --run-id $RUN_ID --artifacts ${{ inputs.artifacts-dir }}" >> "$GITHUB_STEP_SUMMARY"
+        echo "\`\`\`"                           >> "$GITHUB_STEP_SUMMARY"
+
+        exit $EXIT_CODE
+
+    - name: Upload evidence bundle
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: patchpilot-evidence-${{ github.run_id }}
+        path: ${{ inputs.artifacts-dir }}/
+        if-no-files-found: ignore

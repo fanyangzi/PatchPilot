@@ -1,0 +1,30 @@
+diff --git a/tests/test_regression.py b/tests/test_regression.py
+index f3c9a71..a8d2e40 100644
+--- a/tests/test_regression.py
++++ b/tests/test_regression.py
+@@ -1,6 +1,7 @@
+ import pytest
+
+ import jinja2
++from jinja2 import Environment
+ from jinja2 import UndefinedError
+
+
+@@ -394,3 +395,17 @@ def test_macro_caller_state() -> None:
+     assert t.module.outer() == "called"
+     assert t.module.outer() == "called"
+     assert t.module.outer() == "called"
++
++
++def test_undefined_call_includes_name() -> None:
++    """Calling an undefined variable should mention its name in the error."""
++    env = Environment(undefined=jinja2.Undefined)
++    tmpl = env.from_string("{{ missing() }}")
++
++    with pytest.raises(UndefinedError) as exc_info:
++        tmpl.render()
++
++    msg = str(exc_info.value)
++    assert "missing" in msg, (
++        f"UndefinedError message should include variable name 'missing', got: {msg!r}"
++    )

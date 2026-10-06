@@ -1,10 +1,26 @@
 import { Fragment, useState } from 'react';
-import { BookOpenCheck, ChevronDown, Clock, GitCommit, ScanSearch, Shield } from 'lucide-react';
-import { CHECKS, VERDICT, verdictOf } from '../model';
-import { DiffView, Loading, Mark, Offline, SampleNote, Stamp, go, useAsync, useRoute } from '../ui';
+import { BookOpenCheck, ChevronDown, Clock, GitCommit, ScanSearch } from 'lucide-react';
+import { CHECKS, verdictOf } from '../model';
+import { DiffView, Loading, Mark, Offline, Stamp, go, useAsync, useRoute } from '../ui';
 import { api } from '../api';
-import type { RunEvent, VerifyResult } from '../api';
-import { INSPECT, type CheckRow } from '../samples';
+import type { RunEvent } from '../api';
+import { RunPicker } from './RunPicker';
+
+type CheckRow = {
+  id: string;
+  key: string;
+  name: string;
+  state: 'pass' | 'block' | 'skip';
+  judgement: string;
+  basis: string;
+  paths?: Array<{ path: string; change: string; note: string; ok: boolean }>;
+  hits?: Array<{ path: string; pattern: string }>;
+  evidence?: Array<
+    | { kind: 'raw'; label: string; text: string }
+    | { kind: 'diff'; label: string; text: string }
+    | { kind: 'facts'; label: string; rows: [string, string][] }
+  >;
+};
 
 function FactsBlock({ rows }: { rows: [string, string][] }) {
   return <dl className="g-facts">{rows.map(([k, v]) => <Fragment key={k}><dt>{k}</dt><dd>{v}</dd></Fragment>)}</dl>;
@@ -48,7 +64,7 @@ function CheckItem({ row }: { row: CheckRow }) {
       <p className="g-check-basis">{row.basis}</p>
     </div>
     <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
-      <Mark ok={!blocked} />
+      <Mark ok={row.state === 'pass' ? true : row.state === 'block' ? false : undefined} />
       {hasDetail && <ChevronDown size={14} className="g-check-chevron" />}
     </div>
   </div>;
@@ -60,11 +76,11 @@ function CheckItem({ row }: { row: CheckRow }) {
   </details>;
 }
 
-function DossierShell({ runId, issueTitle, repo, commit, runtimeSec, attempts, verdict, checks, chain, verdictHash }: {
+function DossierShell({ runId, issueTitle, repo, commit, runtimeSec, attempts, verdict, checks, chain, verdictHash, verifyPending, verifyError, verifyValid }: {
   runId: string; issueTitle: string; repo: string; commit: string | null;
   runtimeSec: number; attempts: number; verdict: import('../model').Verdict;
   checks: CheckRow[]; chain: Array<{ seq: string; kind: string; prev: string | null; hash: string | null }>;
-  verdictHash: string | null;
+  verdictHash: string | null; verifyPending?: boolean; verifyError?: string; verifyValid?: boolean | null;
 }) {
   const [showVerify, setShowVerify] = useState(false);
   const passCount = checks.filter(c => c.state === 'pass').length;
@@ -107,11 +123,16 @@ function DossierShell({ runId, issueTitle, repo, commit, runtimeSec, attempts, v
         : <p className="g-chain-empty">无哈希链数据（运行尚未封存或版本过旧）</p>}
       <div className="g-verdict-hash">
         <span className="g-verdict-hash-label">verdict_hash</span>
-        <span className="g-verdict-hash-val">{verdictHash ?? '—'}</span>
+        <span className="g-verdict-hash-val">{verifyPending ? '正在复核…' : verdictHash ?? '—'}</span>
+        {!verifyPending && verifyValid !== null && verifyValid !== undefined &&
+          <span className={`g-verify-status ${verifyValid ? 'ok' : 'bad'}`} role="status">
+            {verifyValid ? '链与结论已复核' : '复核发现不一致'}
+          </span>}
         <button className="g-verify-toggle" onClick={() => setShowVerify(v => !v)}>
           {showVerify ? '收起' : '复核这次结论'}
         </button>
       </div>
+      {verifyError && <p className="g-verify-error" role="status">哈希复核暂不可用：{verifyError}</p>}
       {showVerify && <div className="g-verify-panel">
         <code>patchpilot verify --run-id {runId}</code>
         <br />重算哈希链与 verdict_hash，改一个字节即非零退出。结论由测量推导，不由标签决定。
@@ -121,7 +142,9 @@ function DossierShell({ runId, issueTitle, repo, commit, runtimeSec, attempts, v
 }
 
 function checksFromEvents(events: import('../api').RunEvent[]): CheckRow[] {
-  const verifyEv = events.find(e => e.kind === 'verification');
+  // A retry produces multiple verification events. The dossier must reflect
+  // the final gate decision, while the run detail keeps the full history.
+  const verifyEv = [...events].reverse().find(e => e.kind === 'verification');
   const raw: Record<string, boolean> = verifyEv?.data?.checks ?? {};
   return CHECKS.map((def, i) => {
     const result = raw[def.key];
@@ -140,22 +163,17 @@ export function InspectPage() {
   const route = useRoute();
   const id = route.id;
 
+  const entry = useAsync(() => id ? Promise.resolve([]) : api.runs(), [id]);
+
   const { data: run, error: runErr, loading: runLoading, reload } = useAsync(
     () => id ? api.run(id) : Promise.resolve(null), [id]);
   const { data: events, loading: evLoading } = useAsync(
     () => id ? api.events(id) : Promise.resolve(null), [id]);
-  const { data: verify } = useAsync(
+  const { data: verify, error: verifyErr, loading: verifyLoading } = useAsync(
     () => id ? api.verify(id) : Promise.resolve(null), [id]);
 
   if (!id) {
-    const d = INSPECT;
-    const sampleChain = d.chain.map(r => ({ seq: String(r.seq), kind: r.kind, prev: r.prev, hash: r.hash }));
-    return <>
-      <SampleNote>模拟数据，仓库与哈希均为虚构。从运行记录点进来即读取真实数据。</SampleNote>
-      <DossierShell runId={d.runId} issueTitle={d.issueTitle} repo={d.repo} commit={d.commit}
-        runtimeSec={d.runtimeSec} attempts={d.attempts} verdict={d.verdict}
-        checks={d.checks} chain={sampleChain} verdictHash={d.verdictHash} />
-    </>;
+    return <RunPicker page="inspect" runs={entry.data} loading={entry.loading} error={entry.error} onRetry={entry.reload} />;
   }
 
   if (runLoading || evLoading) return <Loading />;
@@ -178,5 +196,8 @@ export function InspectPage() {
     checks={checks}
     chain={chain}
     verdictHash={verify?.verdict_hash ?? null}
+    verifyPending={verifyLoading}
+    verifyError={verifyErr}
+    verifyValid={verify?.valid}
   />;
 }

@@ -1,6 +1,6 @@
 /** Typed client for the PatchPilot FastAPI service (src/patchpilot/api.py). */
 
-export type Conclusion = 'TRUSTED_DELIVERY' | 'NEEDS_REVIEW' | 'FAILED' | 'UNSAFE_DELIVERY' | null;
+export type Conclusion = 'TRUSTED_DELIVERY' | 'NEEDS_REVIEW' | 'FAILED' | 'UNSAFE_DELIVERY' | 'INFRA_ERROR' | null;
 export type Scenario = 'normal' | 'failure' | 'risk';
 
 export type TaskInfo = {
@@ -24,6 +24,35 @@ export type RunEvent = {
 
 export type ArtifactRecord = { id: string; kind: string; name: string; sha256: string; size: number };
 export type ArtifactContent = { artifact_id: string; name: string; kind: string; truncated: boolean; content: string };
+
+export type PolicyData = {
+  run_id?: string;
+  source: string;
+  scope?: string[];
+  allowed_paths: string[];
+  sensitive_patterns: string[];
+  required_checks: string[];
+  max_attempts: number;
+  compiled_at?: number;
+  commit?: string | null;
+  repository?: string;
+  yaml?: string;
+};
+
+export type VerifyResult = {
+  run_id: string;
+  valid: boolean;
+  chain_valid?: boolean;
+  event_count: number;
+  verdict_hash: string | null;
+  verdict_hash_expected?: string | null;
+  verdict_hash_valid?: boolean | null;
+  chain: Array<{ event_id: string; kind: string; prev_hash: string | null; event_hash: string | null }>;
+};
+
+export type AdHocRunBody = {
+  repo: string; commit: string; issue_title: string; issue_body: string; test_command?: string;
+};
 
 export type EvalRow = {
   task_id: string; scenario: Scenario; method: string; status: string;
@@ -87,4 +116,11 @@ export const api = {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ task_id: taskId }),
   }),
+  startAdHocRun: (body: AdHocRunBody) => request<RunRecord>('/runs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }),
+  verify: (id: string) => request<VerifyResult>(`/runs/${enc(id)}/verify`),
+  policy: (id: string) => request<PolicyData>(`/runs/${enc(id)}/policy`),
 };

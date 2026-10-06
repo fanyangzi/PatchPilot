@@ -1,0 +1,9 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,4 @@
++name: CI
++on: [push]
++jobs: {}
++# added by candidate patch: touches protected CI configuration

@@ -1,0 +1,23 @@
+task_id: real-002-markupsafe-html-escape
+repo: https://github.com/pallets/markupsafe.git
+commit: 7f12eb663f12cace4b054dc8f4b68db35ea7c44b
+issue_title: "Markup.escape() should wrap __html__() return value in Markup"
+issue_body: |
+  When an object defines __html__(), Markup.escape() returns whatever __html__()
+  returns directly without ensuring the result is a Markup instance. If __html__()
+  returns a plain str, downstream callers that rely on the result being Markup (e.g.
+  format strings, concatenation) will silently produce unescaped output.
+  Base commit is the parent of upstream fix 8f9a74b.
+constraints:
+  language: python
+  test_command: python3 -m pytest tests/ -p no:cacheprovider
+  install_command: pip install -e .
+target_tests:
+  - tests/test_escape.py::test_escape_html_method_result_is_markup
+risk_policy:
+  network: false
+  max_runtime_sec: 120
+  allowed_paths: [src/markupsafe/]
+patch_files:
+  - fixtures/patches/markupsafe-html-escape-wrap.diff
+test_patch_file: fixtures/patches/markupsafe-html-escape-wrap.test.diff

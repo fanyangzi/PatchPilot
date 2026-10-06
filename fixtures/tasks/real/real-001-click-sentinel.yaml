@@ -1,0 +1,24 @@
+task_id: real-001-click-sentinel
+repo: https://github.com/pallets/click.git
+commit: 420c8fb44eeadb537cae69d2fee3796e808558dd
+issue_title: "Fix copy, deepcopy and pickle of Sentinel members"
+issue_body: |
+  Upstream changelog entry for the fix (pallets/click#3805): "Fix `copy.deepcopy()` and `pickle`
+  on a `Parameter`, `Option` or `Command`." The Sentinel members used as default markers lose their
+  identity when copied or pickled, so duplicated parameters no longer compare equal to UNSET.
+  Base commit is the parent of upstream fix commit f58ca3e81424a35626c8a475eb59ab95589008ce.
+constraints:
+  language: python
+  test_command: python3 -m pytest tests --ignore=tests/test_deprecations.py -p no:cacheprovider
+  pythonpath: [src]
+target_tests:
+  - tests/test_utils/test_sentinel.py::test_sentinel_duplication_preserves_identity[pickle-Sentinel.UNSET]
+  - tests/test_utils/test_sentinel.py::test_sentinel_duplication_preserves_identity[pickle-Sentinel.FLAG_NEEDS_VALUE]
+  - tests/test_utils/test_sentinel.py::test_parameter_duplication[pickle]
+risk_policy:
+  network: false
+  max_runtime_sec: 180
+  allowed_paths: [src/click/]
+patch_files:
+  - fixtures/patches/click-sentinel-copy-pickle.diff
+test_patch_file: fixtures/patches/click-sentinel-copy-pickle.test.diff

@@ -1,0 +1,21 @@
+diff --git a/src/markupsafe/__init__.py b/src/markupsafe/__init__.py
+index a3d1bcf..e8c5f12 100644
+--- a/src/markupsafe/__init__.py
++++ b/src/markupsafe/__init__.py
+@@ -165,7 +165,7 @@ class Markup(str):
+ def escape(s: t.Any) -> Markup:
+     """Convert an object to a :class:`Markup` string, replacing special
+     HTML characters. If the object defines :meth:`__html__`, that method
+-    is called and the return value is assumed to already be safe.
++    is called and the return value is wrapped in :class:`Markup`.
+
+     :param s: An object to be converted to a ``Markup`` string.
+     """
+@@ -173,7 +173,7 @@ def escape(s: t.Any) -> Markup:
+         return Markup.__new__(Markup, s)
+
+     if hasattr(s, "__html__"):
+-        return s.__html__()
++        return Markup(s.__html__())
+
+     return Markup.__new__(Markup, _simple_escaping_wrapper(s))

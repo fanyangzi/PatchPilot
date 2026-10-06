@@ -1,11 +1,5 @@
 /* gate.css — layout for 仓库体检 and 策略 pages. All new classes use g- prefix. */
 
-/* Sample strip */
-.g-sample { display:flex; align-items:center; gap:8px; padding:6px 12px; margin-bottom:24px;
-  border:1px dashed var(--rule-3); border-radius:var(--r-ctl); color:var(--ink-3); font-size:var(--t-xs); }
-.g-sample b { font-size:var(--t-xs); padding:1px 6px; background:var(--sheet-2);
-  border:1px solid var(--rule-2); border-radius:2px; color:var(--ink-2); margin-right:4px; }
-
 /* Stamp extensions (base.css has sm/md/lg; gate adds xl and date) */
 .stamp-xl { font-size:44px; border-width:4px; padding:6px; }
 .stamp-xl .stamp-text { border-width:2px; padding:.18em .5em .18em .65em; }
@@ -27,6 +21,32 @@
 .g-chip { display:inline-flex; align-items:center; gap:4px; height:24px; padding:0 8px;
   font-size:12.5px; font-family:var(--code); background:var(--sheet-2);
   border:1px solid var(--rule-2); border-radius:var(--r-in); color:var(--ink-2); }
+
+/* ── Real run entry ───────────────────────────────────────────── */
+.g-entry { display:flex; flex-direction:column; gap:24px; max-width:920px; }
+.g-entry-head { border-bottom:1px solid var(--rule); padding-bottom:22px; }
+.g-entry-kicker { display:inline-flex; align-items:center; gap:7px; color:var(--ink-3); font-size:var(--t-xs); margin-bottom:8px; }
+.g-entry-kicker svg { color:var(--ink-2); }
+.g-entry-head h1 { font:700 var(--t-2xl)/1.25 var(--serif); margin-bottom:10px; }
+.g-entry-head p { color:var(--ink-2); max-width:70ch; line-height:1.75; }
+.g-entry-empty { display:flex; flex-direction:column; align-items:flex-start; gap:12px; }
+.g-run-chooser { border:1px solid var(--rule); background:var(--sheet); }
+.g-run-chooser-head { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:16px 18px; border-bottom:1px solid var(--rule-2); background:var(--sheet-2); }
+.g-run-chooser-head > div { display:grid; gap:3px; }
+.g-run-chooser-head strong { font-size:var(--t-sm); }
+.g-run-chooser-head span { color:var(--ink-3); font-size:var(--t-xs); }
+.g-run-options { list-style:none; }
+.g-run-options li + li { border-top:1px solid var(--rule-2); }
+.g-run-option { width:100%; display:grid; grid-template-columns:30px minmax(0,1fr) auto auto; gap:12px; align-items:center; padding:14px 18px; border:0; background:var(--sheet); text-align:left; cursor:pointer; color:var(--ink); }
+.g-run-option:hover, .g-run-option:focus-visible { background:var(--surface-hover); }
+.g-run-option-recommended { border-left:3px solid var(--ink); padding-left:15px; }
+.g-run-option-icon { width:26px; height:26px; display:grid; place-items:center; border:1px solid var(--rule-3); color:var(--ink-2); }
+.g-run-option-copy { min-width:0; display:grid; gap:3px; }
+.g-run-option-copy strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:var(--t-sm); font-weight:600; }
+.g-run-option-copy span { color:var(--ink-3); font-size:var(--t-xs); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.g-run-option-verdict { justify-self:center; }
+.g-run-option-meta { display:inline-flex; align-items:center; gap:8px; color:var(--ink-3); font:400 var(--t-xs)/1 var(--code); white-space:nowrap; }
+.g-entry-foot { color:var(--ink-3); font-size:var(--t-xs); }
 
 /* ── Check ledger ──────────────────────────────────────────────── */
 .g-checks { display:flex; flex-direction:column; gap:0;
@@ -94,6 +114,10 @@ details[open] .g-check-chevron { transform:rotate(180deg); }
 .g-verdict-hash-label { font-size:var(--t-xs); color:#9AAFC8; white-space:nowrap; }
 .g-verdict-hash-val { font:500 var(--t-xs)/1.5 var(--code); color:#CFD8E6;
   word-break:break-all; flex:1; }
+.g-verify-status { font-size:var(--t-xs); white-space:nowrap; }
+.g-verify-status.ok { color:#8FE0BC; }
+.g-verify-status.bad { color:#FF9080; }
+.g-verify-error { margin:0; color:#E7B7AE; font-size:var(--t-xs); }
 .g-verify-toggle { background:transparent; border:1px solid rgba(255,255,255,.18);
   color:#CFD8E6; border-radius:var(--r-ctl); padding:5px 12px; font-size:var(--t-xs);
   cursor:pointer; flex:none; }
@@ -160,6 +184,11 @@ details[open] .g-check-chevron { transform:rotate(180deg); }
   .g-rung-hash { display:none; }
 }
 @media (max-width:780px) {
+  .g-run-chooser-head { align-items:flex-start; flex-direction:column; }
+  .g-run-option { grid-template-columns:26px minmax(0,1fr) auto; gap:9px; padding:12px; }
+  .g-run-option-verdict { grid-column:3; grid-row:1; }
+  .g-run-option-meta { grid-column:2 / -1; grid-row:2; justify-self:start; padding-top:2px; }
+  .g-run-option-recommended { padding-left:9px; }
   .g-clause { grid-template-columns:1fr; }
   .g-clause-left { border-right:0; border-bottom:1px solid var(--rule-2); }
   .g-rung { grid-template-columns:4ch 1fr; }

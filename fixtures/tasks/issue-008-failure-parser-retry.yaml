@@ -11,3 +11,6 @@ risk_policy:
   network: false
   max_runtime_sec: 30
   allowed_paths: [src/, tests/]
+patch_files:
+  - fixtures/patches/parser-strip-only.diff
+  - fixtures/patches/parser-validate-pair.diff

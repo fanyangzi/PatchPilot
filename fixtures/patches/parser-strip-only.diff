@@ -1,0 +1,8 @@
+diff --git a/src/parser.py b/src/parser.py
+index f2a7f1a..7df649e 100644
+--- a/src/parser.py
++++ b/src/parser.py
+@@ -1,2 +1,2 @@
+ def parse_pair(text):
+-    return tuple(text.split(':'))
++    return tuple(part.strip() for part in text.split(":"))

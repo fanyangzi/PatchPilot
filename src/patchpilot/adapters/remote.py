@@ -18,7 +18,7 @@ class RemoteModelConfig:
     def public(self): return {'base_url':self.base_url,'model':self.model,'configured':bool(self.base_url and self.api_key)}
 
 class RemoteModel:
-    def __init__(self,config=None): self.config=config or RemoteModelConfig()
+    def __init__(self,config=None): self.config=config or RemoteModelConfig(); self.last_usage={}
     def _url(self): return self.config.base_url.rstrip('/')+'/chat/completions'
     def chat(self,messages,temperature=0.1,json_mode=False):
         if not self.config.base_url or not self.config.api_key: raise RuntimeError('Remote model is not configured; set BASE_URL/API_KEY in .env.local')
@@ -28,6 +28,7 @@ class RemoteModel:
         try:
             with urllib.request.urlopen(req,timeout=self.config.timeout) as r: data=json.loads(r.read())
         except urllib.error.HTTPError as e: raise RuntimeError(f'model request failed HTTP {e.code}') from e
+        if 'usage' in data: self.last_usage = data['usage']
         return data['choices'][0]['message']['content']
     def doctor(self):
         return self.chat([{'role':'user','content':'Return JSON exactly: {"status":"ok"}'}],temperature=0,json_mode=True)
@@ -74,3 +75,27 @@ class RemoteModel:
             'risk_flags': [str(x)[:120] for x in value.get('risk_flags', []) if isinstance(x, (str, int))][:8],
             'acceptance_checks': [str(x)[:160] for x in value.get('acceptance_checks', []) if isinstance(x, (str, int))][:8],
         }
+
+    def propose_patch(self, task, repo_files: dict, failed_tests: list) -> str:
+        files_ctx = '\n\n'.join(f'=== {p} ===\n{c[:2000]}' for p, c in list(repo_files.items())[:10])
+        tests_ctx = 'Failed tests:\n' + '\n'.join(f'- {t}' for t in failed_tests[:10])
+        prompt = (
+            'You are a code repair assistant. Generate a unified diff patch to fix the issue.\n\n'
+            f'Issue: {task.issue_title}\n{task.issue_body[:1000]}\n\n'
+            f'{tests_ctx}\n\nRepository files:\n{files_ctx}\n\n'
+            'Return ONLY a valid unified diff (--- a/path +++ b/path format). No markdown fences.'
+        )
+        raw = self.chat([
+            {'role': 'system', 'content': 'You generate unified diff patches for code fixes.'},
+            {'role': 'user', 'content': prompt}
+        ], temperature=0.2)
+        diff = raw.strip()
+        if diff.startswith('```'):
+            diff = re.sub(r'^```(?:diff)?\s*|\s*```$', '', diff, flags=re.I | re.S).strip()
+        return diff
+
+    def get_estimated_cost(self) -> float:
+        if not self.last_usage: return 0.0
+        p = self.last_usage.get('prompt_tokens', 0)
+        c = self.last_usage.get('completion_tokens', 0)
+        return round((p * 0.03 + c * 0.06) / 1000, 6)

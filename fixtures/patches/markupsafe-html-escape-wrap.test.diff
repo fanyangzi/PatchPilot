@@ -1,0 +1,29 @@
+diff --git a/tests/test_escape.py b/tests/test_escape.py
+index c3d8e51..7f1a9c0 100644
+--- a/tests/test_escape.py
++++ b/tests/test_escape.py
+@@ -1,6 +1,7 @@
+ import pytest
+
+ from markupsafe import Markup
++from markupsafe import escape
+
+
+ def test_markup_operations() -> None:
+@@ -55,3 +56,15 @@ def test_markup_set() -> None:
+     )
+     assert Markup("{0}").format(*s) == "&lt;foo&gt;"
+     assert Markup("{0}").format(**{"0": "<foo>"}) == "&lt;foo&gt;"
++
++
++def test_escape_html_method_result_is_markup() -> None:
++    """escape() must return Markup even when __html__ returns a plain str."""
++
++    class HasHtml:
++        def __html__(self) -> str:
++            return "<b>safe</b>"
++
++    result = escape(HasHtml())
++    assert isinstance(result, Markup), (
++        f"escape() should return Markup, got {type(result).__name__!r}"
++    )

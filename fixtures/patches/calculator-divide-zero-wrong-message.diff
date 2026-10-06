@@ -1,0 +1,9 @@
+diff --git a/src/calculator.py b/src/calculator.py
+index 5df2688..57a2184 100644
+--- a/src/calculator.py
++++ b/src/calculator.py
+@@ -1,2 +1,4 @@
+ def divide(a, b):
++    if b == 0:
++        raise ZeroDivisionError("division by zero")
+     return a / b

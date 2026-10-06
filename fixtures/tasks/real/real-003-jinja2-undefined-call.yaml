@@ -1,0 +1,23 @@
+task_id: real-003-jinja2-undefined-call
+repo: https://github.com/pallets/jinja.git
+commit: b08cd4bc64bb980df86ed2876978ae5735572280
+issue_title: "Calling an Undefined value should include the variable name in the error"
+issue_body: |
+  When a template calls an undefined variable as a function, e.g. {{ missing() }},
+  the resulting UndefinedError message reads "undefined is not callable" instead of
+  "'missing' is undefined" or similar. The variable name is lost because
+  Undefined.__call__ raises a generic message rather than delegating to _fail_with_undefined_error.
+  Base commit is the parent of the upstream fix that restored name propagation.
+constraints:
+  language: python
+  test_command: python3 -m pytest tests/ -p no:cacheprovider
+  install_command: pip install -e .
+target_tests:
+  - tests/test_regression.py::test_undefined_call_includes_name
+risk_policy:
+  network: false
+  max_runtime_sec: 120
+  allowed_paths: [src/jinja2/]
+patch_files:
+  - fixtures/patches/jinja2-undefined-call.diff
+test_patch_file: fixtures/patches/jinja2-undefined-call.test.diff

@@ -1,0 +1,11 @@
+diff --git a/src/parser.py b/src/parser.py
+index f2a7f1a..6cdcc5c 100644
+--- a/src/parser.py
++++ b/src/parser.py
+@@ -1,2 +1,5 @@
+ def parse_pair(text):
+-    return tuple(text.split(':'))
++    left, _, right = text.partition(":")
++    if not left or not right:
++        raise ValueError("expected left:right")
++    return left.strip(), right.strip()

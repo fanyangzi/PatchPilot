@@ -1,0 +1,15 @@
+diff --git a/src/jinja2/runtime.py b/src/jinja2/runtime.py
+index 8e3a1c2..2b70fd9 100644
+--- a/src/jinja2/runtime.py
++++ b/src/jinja2/runtime.py
+@@ -838,10 +838,7 @@ class Undefined:
+         return ""
+
+     def __call__(self, *args: t.Any, **kwargs: t.Any) -> t.Any:
+-        if 0:
+-            yield None
+-        raise UndefinedError(f"{self._undefined_name!r} is undefined")
++        self._fail_with_undefined_error(*args, **kwargs)
+
+     def __iter__(self) -> t.Iterator[t.Any]:
+         if 0:

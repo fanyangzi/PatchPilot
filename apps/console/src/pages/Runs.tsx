@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { Activity, Clock, RefreshCw } from 'lucide-react';
 import type { RunRecord, Scenario } from '../api';
 import { SCENARIO, secs, verdictOf, when } from '../model';
 import { Empty, href } from '../ui';
@@ -13,15 +14,20 @@ export function RunsPage({ runs, selectedId, freshId }: { runs: RunRecord[]; sel
   const count = (f: Filter) => f === 'all' ? runs.length : runs.filter((r) => r.task?.scenario === f).length;
 
   return <div className="runs">
-    <aside className="runs-list" aria-label="运行记录列表">
+    <aside className="runs-rail" aria-label="运行记录列表">
+      <div className="runs-rail-head">
+        <Activity size={16} />
+        <h1>运行记录</h1>
+        <span className="sec-note">{runs.length} 次</span>
+      </div>
       <div className="filters" role="group" aria-label="按场景筛选">
         {(['all', 'normal', 'failure', 'risk'] as Filter[]).map((f) =>
           <button key={f} className={filter === f ? 'chip on' : 'chip'} aria-pressed={filter === f} onClick={() => setFilter(f)}>
-            {f === 'all' ? '全部' : SCENARIO[f].name}<span>{count(f)}</span>
+            {f === 'all' ? '全部' : SCENARIO[f].name}<b>{count(f)}</b>
           </button>)}
       </div>
       {visible.length === 0 ? <Empty>这个场景还没有运行记录。</Empty> :
-        <ol className="run-items">
+        <ol className="run-list">
           {visible.map((r) => {
             const v = verdictOf(r.conclusion);
             return <li key={r.id}>
@@ -29,16 +35,20 @@ export function RunsPage({ runs, selectedId, freshId }: { runs: RunRecord[]; sel
                 <span className={`dot dot-${v}`} aria-hidden />
                 <span className="run-item-main">
                   <strong>{r.title}</strong>
-                  <span>{r.task ? SCENARIO[r.task.scenario].name : '本地运行'}，{r.attempt > 1 ? `重试 ${r.attempt - 1} 次` : '一次完成'}，{secs(r.runtime_sec)}</span>
+                  <span className="run-item-meta">
+                    {r.task && <span>{SCENARIO[r.task.scenario].name}</span>}
+                    <span><RefreshCw size={10} />{r.attempt > 1 ? `重试 ${r.attempt - 1} 次` : '一次完成'}</span>
+                    <span><Clock size={10} />{secs(r.runtime_sec)}</span>
+                    <span>{when(r.updated_at)}</span>
+                  </span>
                 </span>
-                <time>{when(r.updated_at)}</time>
               </a>
             </li>;
           })}
         </ol>}
     </aside>
-    <section className="runs-detail">
+    <div className="runs-detail">
       {selected ? <RunDetail key={selected.id} run={selected} fresh={selected.id === freshId} /> : <Empty>选择左侧的一条运行记录。</Empty>}
-    </section>
+    </div>
   </div>;
 }

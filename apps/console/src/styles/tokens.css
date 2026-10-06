@@ -1,43 +1,86 @@
-/* PatchPilot console tokens.
- * A review desk, not a cockpit: cool paper, blue-black ink, and a vermilion
- * seal reserved for verdicts. Jade marks what passed; vermilion marks what
- * was stopped. Nothing else gets saturated color. */
+/* PatchPilot console — design tokens.
+ *
+ * The subject is a policy-constrained maintenance runtime: every run ends in a
+ * verdict that a maintainer has to be able to check line by line. The console
+ * is therefore built as a forensic record, not a dashboard — cool paper, blue
+ * black ink, hairline rules, and a numbered index down the page.
+ *
+ * Two rules the whole design obeys:
+ *   1. Colour carries verdict only. Jade / vermilion / amber never decorate.
+ *   2. Structure is drawn with 1px rules, never with a stack of shadowed cards.
+ */
 :root {
-  --paper: #EEF1F4;
-  --sheet: #FFFFFF;
-  --sheet-2: #F6F8FA;
-  --ink: #16233A;
-  --ink-2: #44526A;
-  --ink-3: #7A8699;
-  --rule: #D9DFE7;
-  --rule-2: #E8ECF1;
+  /* ---- surface ---- */
+  --ground:   #EDF1F6;   /* the desk */
+  --sheet:    #FFFFFF;   /* the record itself */
+  --sheet-2:  #F6F8FB;   /* inset panels, table headers */
+  --sheet-3:  #E7ECF3;   /* rails, gutters, meter tracks */
+  --ink-slab: #0B1524;   /* the one dark band: masthead and code */
 
-  --jade: #1E7F5C;
-  --jade-wash: #E3F2EB;
-  --seal: #C23A2B;
-  --seal-wash: #FBEAE7;
-  --amber: #A86412;
-  --amber-wash: #FBF0DF;
-  --focus: #2F5BD3;
+  /* ---- ink ---- */
+  --ink:    #0F1A2B;
+  --ink-2:  #47566E;
+  --ink-3:  #74829A;
+  --ink-4:  #9AA6BA;
 
-  --serif: "Songti SC", "STSong", "Noto Serif SC", "Source Han Serif SC", "SimSun", serif;
-  --sans: "PingFang SC", "HarmonyOS Sans SC", "Microsoft YaHei", "Noto Sans SC", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --code: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  /* ---- rules ---- */
+  --rule:   #D5DEE9;
+  --rule-2: #E6ECF3;
+  --rule-3: #C2CEDC;
 
-  /* type scale, 1.25 ratio from 15px body */
-  --t-xs: 12px;
-  --t-sm: 13px;
-  --t-md: 15px;
-  --t-lg: 18px;
-  --t-xl: 23px;
-  --t-2xl: 29px;
-  --t-hero: clamp(34px, 4.4vw, 56px);
+  /* ---- verdict (the only saturated colour in the system) ---- */
+  --jade:       #0F7050;
+  --jade-wash:  #E2F1EA;
+  --seal:       #B4301F;
+  --seal-wash:  #FBE9E5;
+  --amber:      #8A5A0B;
+  --amber-wash: #F9EFDC;
+  --focus:      #2B56C8;
 
-  /* radius encodes hierarchy: sheets are soft, controls are tighter, chips are pills */
-  --r-sheet: 14px;
-  --r-ctl: 8px;
-  --r-pill: 999px;
+  /* ---- mapped tokens for gate pages ---- */
+  --surface-base: var(--sheet);
+  --surface-raised: var(--sheet-2);
+  --surface-sunk: var(--sheet-3);
+  --surface-hover: var(--sheet-2);
 
-  --shadow-sheet: 0 1px 0 rgba(22, 35, 58, .04), 0 8px 24px -12px rgba(22, 35, 58, .12);
-  --wrap: 1240px;
+  --ink-primary: var(--ink);
+  --ink-secondary: var(--ink-2);
+  --ink-muted: var(--ink-3);
+  --ink-border: var(--rule);
+  --ink-hairline: var(--rule-2);
+
+  --verdict-trusted: var(--jade);
+  --verdict-blocked: var(--seal);
+  --verdict-pending: var(--amber);
+
+  --accent-electric: #22D3EE;
+  --accent-warm: #F59E0B;
+
+  /* ---- type ---- */
+  --serif: "Songti SC", "STSong", "Noto Serif SC", "Source Han Serif SC", "SimSun", Georgia, serif;
+  --sans:  "PingFang SC", "HarmonyOS Sans SC", "Noto Sans SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --code:  ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+
+  /* 1.28 scale from 15px */
+  --t-2xs: 11px;
+  --t-xs:  12px;
+  --t-sm:  13px;
+  --t-md:  15px;
+  --t-lg:  18px;
+  --t-xl:  24px;
+  --t-2xl: 31px;
+  --t-3xl: 40px;
+  --t-hero: clamp(36px, 4.6vw, 60px);
+
+  /* ---- geometry: sharp and ruled, not soft and rounded ---- */
+  --r-ctl:  4px;
+  --r-sheet: 8px;
+  --r-in:  2px;
+
+  --wrap: 1280px;
+  --rail: 344px;   /* runs list column */
+  --aside: 320px;  /* routing advisory column */
+  --top: 60px;
+
+  --modal-shadow: none;
 }

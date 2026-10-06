@@ -20,10 +20,11 @@ export function describe(e: RunEvent): string {
     case 'reproduction': return d.returncode === 0
       ? '测试命令在原始代码上通过，没有观察到 Issue 描述的失败。'
       : '测试命令在原始代码上失败，Issue 被成功复现。';
-    case 'localization': return `定位到 ${(d.files || []).join('、')}${d.symbols?.length ? ` 中的 ${d.symbols.join('、')}` : ''}，置信度 ${Math.round((d.confidence || 0) * 100)}%。`;
-    case 'patch': return d.provider === 'deterministic_fixture'
-      ? '在允许的写入范围内生成候选补丁（评测模式下使用可复现的固定补丁源）。'
-      : '在允许的写入范围内生成候选补丁。';
+    case 'localization': return `由复现输出中失败的用例定位：${(d.files || []).join('、')}${d.symbols?.length ? `（${d.symbols.join('、')}）` : ''}。`;
+    case 'patch': return d.provider === 'patch_file'
+      ? `第 ${d.attempt} 个候选补丁来自 ${d.source}，已应用。`
+      : d.provider === 'none' ? `第 ${d.attempt} 次尝试没有候选补丁。` : `第 ${d.attempt} 个候选补丁已应用。`;
+    case 'test_patch': return `复现前已应用测试补丁 ${d.source}。`;
     case 'verification': {
       const failed = CHECKS.filter((c) => d.checks && d.checks[c.key] === false).map((c) => c.name);
       if (d.status === 'PASSED') return '六项检查全部通过。';

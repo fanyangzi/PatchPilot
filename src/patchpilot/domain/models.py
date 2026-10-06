@@ -29,9 +29,14 @@ class TaskSpec:
     constraints: dict[str,Any] = field(default_factory=lambda:{"language":"python","test_command":"pytest -q"})
     risk_policy: dict[str,Any] = field(default_factory=lambda:{"network":False,"max_runtime_sec":180,"allowed_paths":["src/","tests/"]})
     scenario: str = "normal"
+    target_tests: list[str] = field(default_factory=list)
+    test_patch: str = ""
+    test_patch_source: str = ""
+    patches: list[str] = field(default_factory=list)
+    patch_sources: list[str] = field(default_factory=list)
     @classmethod
     def from_dict(cls, data:dict[str,Any]):
-        return cls(task_id=str(data["task_id"]), repo=str(data["repo"]), issue_title=str(data["issue_title"]), issue_body=str(data.get("issue_body","")), commit=str(data.get("commit","working-tree")), expected=list(data.get("expected",["reproduce","patch","regression_test"])), constraints=dict(data.get("constraints",{})), risk_policy=dict(data.get("risk_policy",{})), scenario=str(data.get("scenario","normal")))
+        return cls(task_id=str(data["task_id"]), repo=str(data["repo"]), issue_title=str(data["issue_title"]), issue_body=str(data.get("issue_body","")), commit=str(data.get("commit","working-tree")), expected=list(data.get("expected",["reproduce","patch","regression_test"])), constraints=dict(data.get("constraints",{})), risk_policy=dict(data.get("risk_policy",{})), scenario=str(data.get("scenario","normal")), target_tests=[str(x) for x in data.get("target_tests",[])], test_patch=str(data.get("test_patch","")), test_patch_source=str(data.get("test_patch_source","")), patches=[str(x) for x in data.get("patches",[])], patch_sources=[str(x) for x in data.get("patch_sources",[])])
     def to_dict(self): return asdict(self)
 
 @dataclass
@@ -66,14 +71,26 @@ class Artifact:
 @dataclass
 class Event:
     run_id:str; event_type:str; status:str; message:str; data:dict[str,Any]=field(default_factory=dict); event_id:str=field(default_factory=lambda:uuid.uuid4().hex); ts:float=field(default_factory=time.time)
+    prev_hash:str|None=None; event_hash:str|None=None
     def to_dict(self): return asdict(self)
 
 @dataclass
 class Run:
     run_id:str; task_id:str; status:RunStatus=RunStatus.RECEIVED; started_at:float=field(default_factory=time.time); ended_at:float|None=None
     conclusion:str|None=None; attempt:int=0; metrics:dict[str,Any]=field(default_factory=dict); artifacts:list[str]=field(default_factory=list)
+    verdict_hash:str|None=None
     def to_dict(self):
         d=asdict(self); d["status"]=self.status.value; return d
 
 def stable_hash(data:Any)->str:
     return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
+
+def compute_event_hash(event:Event, prev_hash:str|None)->str:
+    """计算事件哈希 = H(prev_hash || run_id || event_type || status || ts || data)"""
+    content={'prev_hash':prev_hash or '','run_id':event.run_id,'event_type':event.event_type,'status':event.status,'ts':event.ts,'data':event.data}
+    return stable_hash(content)
+
+def compute_verdict_hash(run:Run, checks:dict, task_id:str, commit:str, patch_sha256:str, evidence_root_hash:str)->str:
+    """verdict_hash = H(conclusion || checks || task_id || commit || patch_hash || evidence_root)"""
+    content={'conclusion':run.conclusion or '','checks':checks,'task_id':task_id,'commit':commit,'patch_sha256':patch_sha256,'evidence_root_hash':evidence_root_hash}
+    return stable_hash(content)

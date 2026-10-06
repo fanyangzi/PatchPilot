@@ -1,7 +1,11 @@
-import { SampleNote, Loading, Offline, useAsync, useRoute } from '../ui';
+import { Loading, Offline, useAsync, useRoute } from '../ui';
 import { api } from '../api';
 import type { PolicyData } from '../api';
-import { POLICY, type PolicyRule } from '../samples';
+import type { RunRecord } from '../api';
+import { when } from '../model';
+import { RunPicker } from './RunPicker';
+
+type PolicyRule = { key: string; value: string; list?: string[]; note?: string; strong?: boolean };
 
 function RuleBlock({ rules }: { rules: PolicyRule[] }) {
   return <div className="g-rules">
@@ -44,6 +48,12 @@ function PolicyShell({ data, runId }: { data: PolicyData; runId: string }) {
       <p className="g-policy-preamble" style={{ fontSize: 'var(--t-xs)', color: 'var(--ink-3)', marginTop: 4 }}>
         运行 {runId} 所用策略
       </p>
+      <div className="g-meta-chips" aria-label="策略来源">
+        {data.repository && <span className="g-chip">仓库 · {data.repository}</span>}
+        {data.commit && <span className="g-chip">commit · {data.commit.slice(0, 8)}</span>}
+        {data.compiled_at && <span className="g-chip">编译于 · {when(data.compiled_at)}</span>}
+        {data.scope?.length && <span className="g-chip">作用域 · {data.scope.join('，')}</span>}
+      </div>
     </div>
 
     <div className="g-clauses">
@@ -75,6 +85,13 @@ function PolicyShell({ data, runId }: { data: PolicyData; runId: string }) {
         </div>
       </div>
     </div>
+    {data.yaml && <div className="g-yaml-band">
+      <h3>编译后的策略 · YAML</h3>
+      <pre className="g-yaml-pre">{data.yaml.split('\n').filter(Boolean).map((line, i) => {
+        const cls = lineClass(line);
+        return <span key={i} className={`g-yl${cls ? ` ${cls}` : ''}`}>{line}</span>;
+      })}</pre>
+    </div>}
   </div>;
 }
 
@@ -82,60 +99,13 @@ export function PolicyPage() {
   const route = useRoute();
   const id = route.id;
 
+  const entry = useAsync<RunRecord[]>(() => id ? Promise.resolve([]) : api.runs(), [id]);
+
   const { data: policy, error, loading, reload } = useAsync(
     () => id ? api.policy(id) : Promise.resolve(null), [id]);
 
   if (!id) {
-    const p = POLICY;
-    return <div>
-      <SampleNote>模拟数据，来自假设仓库的 AI_POLICY.md。从运行记录点进来即读取真实策略。</SampleNote>
-
-      <div className="g-policy-head">
-        <h1 className="g-policy-title">{p.source}</h1>
-        <p className="g-policy-preamble">{p.preamble}</p>
-        <p className="g-policy-preamble" style={{ fontSize: 'var(--t-xs)', color: 'var(--ink-3)', marginTop: 4 }}>
-          来源：{p.repo} @ {p.sourceCommit} · 编译于 {p.compiledAt} · 生效分支：{p.scope}
-        </p>
-      </div>
-
-      <div className="g-clauses">
-        {p.clauses.map((c) => (
-          <div key={c.n} className="g-clause">
-            <div className="g-clause-left">
-              <p className="g-clause-n">第 {c.n} 条</p>
-              <p className="g-clause-text">{c.text}</p>
-              {c.skipped && <p className="g-clause-skipped">{c.skipped}</p>}
-            </div>
-            <div className="g-clause-right">
-              {c.rules.length > 0
-                ? <RuleBlock rules={c.rules} />
-                : <p style={{ fontSize: 'var(--t-xs)', color: 'var(--ink-3)', margin: 0 }}>无可执行检查</p>}
-            </div>
-          </div>
-        ))}
-      </div>
-
-      <div className="g-floor">
-        <div className="g-floor-head">固定规则（所有仓库，不可覆盖）</div>
-        <div className="g-floor-rules">
-          {p.floor.map((r) => (
-            <div key={r.key} className="g-floor-rule">
-              <RuleBlock rules={[r]} />
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div className="g-yaml-band">
-        <h3>编译后的策略 · YAML</h3>
-        <pre className="g-yaml-pre">
-          {p.yaml.map((line, i) => {
-            const cls = lineClass(line);
-            return <span key={i} className={`g-yl${cls ? ` ${cls}` : ''}`}>{line}</span>;
-          })}
-        </pre>
-      </div>
-    </div>;
+    return <RunPicker page="policy" runs={entry.data} loading={entry.loading} error={entry.error} onRetry={entry.reload} />;
   }
 
   if (loading) return <Loading />;
