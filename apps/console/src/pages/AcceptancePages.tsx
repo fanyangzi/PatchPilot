@@ -148,8 +148,12 @@ export function AcceptanceInboxPage({ routeId, onImport }: { routeId?: string; o
 /** Real intake entry point. It creates an intake, draft task and candidate on
  * the server; it never selects a fixture or invents a run result. */
 export function IntakeDialog({ onClose, onCreated }: { onClose: () => void; onCreated: (taskId: string) => void }) {
+  const [mode, setMode] = useState<'local_patch' | 'pr' | 'issue_candidate'>('local_patch');
   const [repoId, setRepoId] = useState('');
   const [baseRef, setBaseRef] = useState('main');
+  const [prUrl, setPrUrl] = useState('');
+  const [issueUrl, setIssueUrl] = useState('');
+  const [candidateRef, setCandidateRef] = useState('');
   const [title, setTitle] = useState('');
   const [body, setBody] = useState('');
   const [patch, setPatch] = useState('');
@@ -160,17 +164,20 @@ export function IntakeDialog({ onClose, onCreated }: { onClose: () => void; onCr
     try {
       if (!repoId.trim() || !/^[-A-Za-z0-9_.]+\/[-A-Za-z0-9_.]+$/.test(repoId.trim())) throw new Error('仓库必须填写 owner/name。');
       if (!baseRef.trim()) throw new Error('请填写基线分支或 commit。');
-      if (!title.trim() || !body.trim()) throw new Error('请填写问题标题和真实需求描述。');
-      if (!patch.trim()) throw new Error('请粘贴候选 unified diff；系统不会从空输入生成候选。');
-      const intake = await v1.createIntake({ mode: 'local_patch', repo_id: repoId.trim(), base_ref: baseRef.trim(), patch_text: patch, issue_title: title.trim(), issue_body: body.trim(), source_refs: ['user:submitted-issue'] });
+      if (mode === 'local_patch' && (!title.trim() || !body.trim())) throw new Error('本地补丁必须填写问题标题和真实需求描述。');
+      if (mode === 'local_patch' && !patch.trim()) throw new Error('请粘贴候选 unified diff；系统不会从空输入生成候选。');
+      if (mode === 'pr' && !prUrl.trim()) throw new Error('GitHub PR 导入必须填写 PR URL。');
+      if (mode === 'issue_candidate' && !issueUrl.trim()) throw new Error('Issue + candidate 导入必须填写 Issue URL。');
+      if (mode === 'issue_candidate' && !candidateRef.trim() && !patch.trim()) throw new Error('请填写 candidate ref 或候选 unified diff。');
+      const intake = await v1.createIntake({ mode, repo_id: repoId.trim(), base_ref: baseRef.trim(), pr_url: mode === 'pr' ? prUrl.trim() : undefined, issue_url: mode === 'issue_candidate' ? issueUrl.trim() : undefined, candidate_ref: mode === 'issue_candidate' ? candidateRef.trim() || undefined : undefined, patch_text: patch.trim() || undefined, issue_title: title.trim() || undefined, issue_body: body.trim() || undefined, source_refs: ['user:submitted-issue', prUrl.trim(), issueUrl.trim()].filter(Boolean) });
       const task = await v1.createTask({ intake_id: intake.intake_id, mode: 'verify' });
-      await v1.createCandidate(task.task.task_id, { source: 'upload', base_sha: baseRef.trim(), patch_text: patch, author_type: 'human' });
+      if (patch.trim()) await v1.createCandidate(task.task.task_id, { source: mode === 'pr' ? 'pr' : mode === 'issue_candidate' ? 'pr' : 'upload', base_sha: baseRef.trim(), patch_text: patch, head_sha: candidateRef.trim() || undefined, author_type: mode === 'local_patch' ? 'human' : 'github' });
       onCreated(task.task.task_id);
     } catch (e) { setError(unwrapError(e)); } finally { setBusy(false); }
   }
   return <div className="ac-modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}><form className="ac-modal" onSubmit={submit} aria-labelledby="intake-title">
     <header><div><span className="ac-eyebrow"><GitPullRequest size={13} />REAL INTAKE / F01</span><h2 id="intake-title">导入验收任务</h2><p>输入真实仓库、需求和候选补丁。创建后进入验收队列，不自动运行或显示通过。</p></div><button type="button" className="icon-btn" onClick={onClose} aria-label="关闭"><X size={18} /></button></header>
-    <div className="ac-form-grid"><label>仓库（owner/name）<input value={repoId} onChange={(e) => setRepoId(e.target.value)} placeholder="fanyangzi/PatchPilot" autoFocus /></label><label>基线 ref<input value={baseRef} onChange={(e) => setBaseRef(e.target.value)} placeholder="main 或 commit SHA" /></label><label className="ac-form-wide">问题标题<input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="要验证的真实问题" /></label><label className="ac-form-wide">需求 / Issue 描述<textarea value={body} onChange={(e) => setBody(e.target.value)} rows={4} placeholder="包含可核对的 change、preserve 或 constraint 条件" /></label><label className="ac-form-wide">候选 unified diff<textarea value={patch} onChange={(e) => setPatch(e.target.value)} rows={8} placeholder="粘贴真实候选补丁" /></label></div>
+    <div className="ac-form-grid"><label>导入方式<select value={mode} onChange={(e) => setMode(e.target.value as typeof mode)}><option value="local_patch">本地 unified diff</option><option value="pr">GitHub Pull Request</option><option value="issue_candidate">Issue + candidate</option></select></label><label>仓库（owner/name）<input value={repoId} onChange={(e) => setRepoId(e.target.value)} placeholder="fanyangzi/PatchPilot" autoFocus /></label><label>基线 ref<input value={baseRef} onChange={(e) => setBaseRef(e.target.value)} placeholder="main 或 commit SHA" /></label>{mode === 'pr' && <label className="ac-form-wide">GitHub PR URL<input value={prUrl} onChange={(e) => setPrUrl(e.target.value)} placeholder="https://github.com/owner/repo/pull/123" /></label>}{mode === 'issue_candidate' && <><label>GitHub Issue URL<input value={issueUrl} onChange={(e) => setIssueUrl(e.target.value)} placeholder="https://github.com/owner/repo/issues/123" /></label><label>candidate ref（可选）<input value={candidateRef} onChange={(e) => setCandidateRef(e.target.value)} placeholder="分支或 commit SHA" /></label></>}<label className="ac-form-wide">问题标题（可选）<input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="要验证的真实问题" /></label><label className="ac-form-wide">需求 / Issue 描述（可选）<textarea value={body} onChange={(e) => setBody(e.target.value)} rows={4} placeholder="包含可核对的 change、preserve 或 constraint 条件" /></label>{(mode === 'local_patch' || mode === 'issue_candidate') && <label className="ac-form-wide">候选 unified diff（{mode === 'local_patch' ? '必填' : '可选，Issue + candidate 可改用 candidate ref'}）<textarea value={patch} onChange={(e) => setPatch(e.target.value)} rows={8} placeholder="粘贴真实候选补丁" /></label>}</div>
     {error && <div className="ac-action-error" role="alert"><CircleAlert size={14} />{error}</div>}<footer><button type="button" className="btn" onClick={onClose}>取消</button><button className="btn btn-primary" disabled={busy}>{busy ? <><LoaderCircle size={14} className="spin" />正在保存</> : <><ClipboardCheck size={14} />创建验收任务</>}</button></footer>
   </form></div>;
 }
