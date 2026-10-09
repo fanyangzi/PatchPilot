@@ -907,8 +907,13 @@ def create_intake(body: IntakeCreate, request: Request):
     scope = "POST:/api/v1/intakes"
     idem_key, prior = _claim_idempotency(request, scope, body)
     if prior and prior.get("response_ref"):
-        existing = _resources().get_intake(prior["response_ref"])
+        resources = _resources()
+        existing = resources.get_intake(prior["response_ref"])
         if existing:
+            owner = resources.acl_workspace("intake", existing["intake_id"])
+            workspace = _workspace_for_request(request)
+            if owner and not hmac.compare_digest(owner, workspace):
+                raise APIError(404, "intake_not_found", "intake does not exist or is not visible")
             return _result(request, {"intake_id": existing["intake_id"], "status": existing["status"], "job_id": None, "intake": existing, "idempotent_replay": True}, 202)
     intake_id = f"intake_{uuid.uuid4().hex}"
     created = utc_now()
@@ -1092,8 +1097,13 @@ def create_task(body: TaskCreate, request: Request):
     scope = "POST:/api/v1/tasks"
     idem_key, prior = _claim_idempotency(request, scope, body)
     if prior and prior.get("response_ref"):
+        resources = _resources()
         existing = _evidence_store().get_task(prior["response_ref"])
         if existing:
+            owner = resources.acl_workspace("task", existing.task_id)
+            workspace = _workspace_for_request(request)
+            if owner and not hmac.compare_digest(owner, workspace):
+                raise APIError(404, "task_not_found", "task does not exist or is not visible")
             return _result(request, {"task": _task_dict(existing), "status": "draft", "idempotent_replay": True}, 201)
     resources = _resources()
     intake = resources.get_intake(body.intake_id)

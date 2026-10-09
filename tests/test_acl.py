@@ -59,6 +59,18 @@ def test_acl_requires_workspace_and_hides_cross_workspace_task_and_job(acl_clien
     assert task["task_id"] not in {item["task_id"] for item in foreign_list.json()["items"]}
 
 
+def test_acl_does_not_leak_idempotent_replays_across_workspaces(acl_client):
+    client, _ = acl_client
+    payload = {
+        "mode": "local_patch", "repo_id": "owner/repo", "base_ref": "main",
+        "patch_text": "diff --git a/a b/a\n--- a/a\n+++ b/a\n",
+    }
+    created = client.post("/api/v1/intakes", headers={**_headers("workspace-a"), "Idempotency-Key": "shared-key"}, json=payload)
+    assert created.status_code == 202
+    replay = client.post("/api/v1/intakes", headers={**_headers("workspace-b"), "Idempotency-Key": "shared-key"}, json=payload)
+    assert replay.status_code == 404
+
+
 def test_acl_binds_candidate_and_report_to_task_workspace(acl_client):
     client, _ = acl_client
     headers = _headers("workspace-a")
