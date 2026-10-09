@@ -428,6 +428,7 @@ class EvidenceStore:
             check_ids: tuple[str, ...] = (),
             condition_id: str | None = None,
             details: dict[str, Any] | None = None,
+            repeats: int = 1,
         ) -> None:
             finding = Finding(
                 finding_id=self._finding_id(verification_id, marker),
@@ -448,7 +449,7 @@ class EvidenceStore:
                 evidence_refs=(f"verification:{verification.verification_id}", *(
                     f"check:{check_id}" for check_id in check_ids
                 )),
-                repeats=1,
+                repeats=repeats,
                 details=details or {},
             )
             self.save_finding(finding)
@@ -545,6 +546,7 @@ class EvidenceStore:
                 f"gap:{gap}", kind=kind, status=status, title=title,
                 message=f"验证记录明确报告缺口：{gap}。该状态不能解释为通过。",
                 source_variant=None, details={"gap": gap},
+                repeats=0 if kind in {"not_run", "baseline_not_run"} else 1,
             )
 
         # Return the durable projection, including rows written by an earlier

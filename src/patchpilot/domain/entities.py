@@ -430,8 +430,8 @@ class Finding:
                 raise ValueError(f"{name} is required")
         if self.contract_revision < 1:
             raise ValueError("contract_revision must be positive")
-        if self.repeats < 1:
-            raise ValueError("repeats must be positive")
+        if self.repeats < 0:
+            raise ValueError("repeats cannot be negative")
         if self.source_variant is not None and self.source_variant not in {"base", "candidate"}:
             raise ValueError("source_variant must be base or candidate")
         object.__setattr__(self, "check_ids", tuple(self.check_ids))
