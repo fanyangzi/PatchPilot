@@ -13,6 +13,7 @@ type CheckRow = {
   state: 'pass' | 'block' | 'skip';
   judgement: string;
   basis: string;
+  hasRawEvidence?: boolean;
   paths?: Array<{ path: string; change: string; note: string; ok: boolean }>;
   hits?: Array<{ path: string; pattern: string }>;
   evidence?: Array<
@@ -109,7 +110,7 @@ function DossierShell({ runId, issueTitle, repo, commit, runtimeSec, attempts, v
 
     <section className="g-evidence-band" aria-label="证据状态">
       <div><strong>证据已封存</strong><span>本次运行的检查结果、执行轨迹和交付物已保存。</span></div>
-      <span className="g-evidence-count">{checks.filter((check) => check.evidence?.length).length}/6 项有原始依据 · {runId}</span>
+      <span className="g-evidence-count">{checks.filter((check) => check.hasRawEvidence).length}/6 项有原始依据 · {runId}</span>
     </section>
   </div>;
 }
@@ -135,6 +136,7 @@ function checksFromEvents(events: import('../api').RunEvent[]): CheckRow[] {
       state: result === false ? 'block' : result === true ? 'pass' : 'skip' as 'pass' | 'block' | 'skip',
       judgement: result === true ? def.hint : result === false ? `${def.name}未通过` : '未执行',
       basis: def.hint,
+      hasRawEvidence: result !== undefined,
       evidence: verifyEv ? [{ kind: 'facts', label: '可复核记录', rows: evidenceRows }] : undefined,
     };
   });
