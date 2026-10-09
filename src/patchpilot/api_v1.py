@@ -2566,7 +2566,13 @@ def _validate_repair_patch(patch_text: str) -> list[str]:
 
 @router.post("/tasks/{task_id}/repairs", status_code=202)
 def create_repair(task_id: str, body: RepairCreate, request: Request):
-    """Generate one real child candidate under an explicit budget approval."""
+    """Generate one real child candidate under an explicit budget approval.
+
+    Provider calls are bounded by ``max_budget`` and every attempt is recorded
+    in the durable job event stream.  A valid patch stops the loop; malformed,
+    duplicate, unavailable or otherwise non-progressing responses consume one
+    budget unit and never mutate the parent candidate or frozen contract.
+    """
     if not body.approved:
         raise APIError(409, "repair_approval_required", "repair requires explicit approval and a bounded budget")
     store = _evidence_store()
@@ -2576,6 +2582,9 @@ def create_repair(task_id: str, body: RepairCreate, request: Request):
     parent = store.get_candidate(body.parent_candidate_id)
     if not parent or parent.task_id != task_id:
         raise APIError(404, "parent_candidate_not_found", "parent candidate does not exist for this task")
+    repair_candidates = [item for item in store.list_candidates(task_id) if item.author_type == "remote_model"]
+    if len(repair_candidates) >= 3:
+        raise APIError(409, "repair_budget_exhausted", "the task has reached the maximum of three repair candidates")
     findings = []
     for finding_id in body.finding_ids:
         finding = store.get_finding(finding_id)
@@ -2604,28 +2613,75 @@ def create_repair(task_id: str, body: RepairCreate, request: Request):
             issue_body=str(issue.get("body", "")),
         )
         failed_tests = [f"{item.kind}: {item.message[:500]}" for item in findings]
-        patch_text = RemoteModel().propose_patch(repair_task, dict(body.repo_files), failed_tests)
-        changed_paths = _validate_repair_patch(patch_text)
-        patch_hash = hashlib.sha256(patch_text.encode("utf-8")).hexdigest()
-        tree_digest = hashlib.sha256(f"repair-tree\0{parent.base_sha}\0{patch_hash}".encode("utf-8")).hexdigest()
-        child = Candidate(
-            f"candidate_{uuid.uuid4().hex}", task_id, parent.base_sha, None,
-            tree_digest, patch_hash, "remote_model", parent.candidate_id,
-        )
-        store.save_candidate(child)
-        resources = _resources()
-        resources.put_candidate_content(child.candidate_id, patch_text, None, patch_hash)
-        workspace = resources.acl_workspace("task", task_id) or _workspace_for_request(request)
-        resources.bind_acl("candidate", child.candidate_id, workspace)
-        resources.bind_acl("job", job_id, workspace)
-        completed = queue.complete(job_id, worker_id, leased["lease_token"], state="completed", payload={
-            "candidate_id": child.candidate_id, "changed_paths": changed_paths,
-            "budget_used": 1, "approved_budget": body.max_budget,
+        provider = RemoteModel()
+        seen_patch_hashes: set[str] = set()
+        attempt_errors: list[dict[str, Any]] = []
+        for attempt in range(1, body.max_budget + 1):
+            if queue.is_cancel_requested(job_id, worker_id, leased["lease_token"]):
+                completed = queue.complete(job_id, worker_id, leased["lease_token"], state="cancelled", payload={
+                    "budget_used": attempt - 1, "approved_budget": body.max_budget,
+                    "attempt_errors": attempt_errors,
+                })
+                return _result(request, {
+                    "status": "cancelled", "job_id": job_id, "parent_candidate_id": parent.candidate_id,
+                    "contract_unchanged": True, "budget_used": attempt - 1, "attempt_errors": attempt_errors,
+                    "job": completed,
+                }, 202)
+            queue.append_event(job_id, "repair_attempt_started", {"attempt": attempt, "budget": body.max_budget})
+            try:
+                patch_text = provider.propose_patch(repair_task, dict(body.repo_files), failed_tests)
+                changed_paths = _validate_repair_patch(patch_text)
+                patch_hash = hashlib.sha256(patch_text.encode("utf-8")).hexdigest()
+                if patch_hash in seen_patch_hashes:
+                    error = {"attempt": attempt, "code": "no_progress", "message": "provider repeated an identical patch"}
+                    attempt_errors.append(error)
+                    queue.append_event(job_id, "repair_attempt_failed", error)
+                    continue
+                seen_patch_hashes.add(patch_hash)
+                tree_digest = hashlib.sha256(f"repair-tree\0{parent.base_sha}\0{patch_hash}".encode("utf-8")).hexdigest()
+                child = Candidate(
+                    f"candidate_{uuid.uuid4().hex}", task_id, parent.base_sha, None,
+                    tree_digest, patch_hash, "remote_model", parent.candidate_id,
+                )
+                store.save_candidate(child)
+                resources = _resources()
+                resources.put_candidate_content(child.candidate_id, patch_text, None, patch_hash)
+                workspace = resources.acl_workspace("task", task_id) or _workspace_for_request(request)
+                resources.bind_acl("candidate", child.candidate_id, workspace)
+                resources.bind_acl("job", job_id, workspace)
+                queue.append_event(job_id, "repair_attempt_succeeded", {
+                    "attempt": attempt, "candidate_id": child.candidate_id, "changed_paths": changed_paths,
+                })
+                completed = queue.complete(job_id, worker_id, leased["lease_token"], state="completed", payload={
+                    "candidate_id": child.candidate_id, "changed_paths": changed_paths,
+                    "budget_used": attempt, "approved_budget": body.max_budget,
+                    "attempt_errors": attempt_errors,
+                })
+                return _result(request, {
+                    "status": "completed", "job_id": job_id, "candidate": child.to_dict(),
+                    "parent_candidate_id": parent.candidate_id, "contract_unchanged": True,
+                    "changed_paths": changed_paths, "budget_used": attempt,
+                    "attempt_errors": attempt_errors, "job": completed,
+                }, 202)
+            except ValueError as exc:
+                error = {"attempt": attempt, "code": "repair_protocol_error", "message": str(exc)[:500]}
+                attempt_errors.append(error)
+                queue.append_event(job_id, "repair_attempt_failed", error)
+            except Exception as exc:
+                error = {"attempt": attempt, "code": "repair_provider_error", "message": str(exc)[:500]}
+                attempt_errors.append(error)
+                queue.append_event(job_id, "repair_attempt_failed", {"attempt": attempt, "code": error["code"]})
+        final_error = attempt_errors[-1] if attempt_errors else {"code": "repair_budget_exhausted", "message": "repair budget exhausted"}
+        exhausted_code = "repair_budget_exhausted" if body.max_budget > 1 else str(final_error.get("code") or "repair_protocol_error")
+        queue.complete(job_id, worker_id, leased["lease_token"], state="error", payload={
+            "error": exhausted_code, "budget_used": body.max_budget,
+            "approved_budget": body.max_budget, "attempt_errors": attempt_errors,
         })
         return _result(request, {
-            "status": "completed", "job_id": job_id, "candidate": child.to_dict(),
+            "status": "error", "job_id": job_id,
+            "error": {"code": exhausted_code, "message": "repair budget exhausted without a new candidate"},
             "parent_candidate_id": parent.candidate_id, "contract_unchanged": True,
-            "changed_paths": changed_paths, "job": completed,
+            "budget_used": body.max_budget, "attempt_errors": attempt_errors,
         }, 202)
     except ValueError as exc:
         queue.complete(job_id, worker_id, leased["lease_token"], state="error", payload={"error": str(exc), "provider": body.provider})

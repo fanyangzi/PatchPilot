@@ -635,6 +635,37 @@ def test_repair_provider_failure_is_explicit_and_does_not_create_candidate(api_c
     assert len(client.get(f"/api/v1/tasks/{task['task_id']}/candidates").json()["items"]) == 1
 
 
+def test_repair_budget_retries_protocol_failure_and_records_attempt_events(api_client, tmp_path, monkeypatch):
+    client, _ = api_client
+    _, _, task, parent, _, finding = _create_candidate_failure_for_followup(client, tmp_path, monkeypatch)
+    from patchpilot.adapters.remote import RemoteModel
+
+    valid_patch = (
+        "diff --git a/calc.py b/calc.py\n"
+        "--- a/calc.py\n+++ b/calc.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def add(a, b):\n"
+        "-    return a + b\n"
+        "+    return a - b\n"
+    )
+    responses = iter(["not a unified diff", valid_patch])
+    monkeypatch.setattr(RemoteModel, "propose_patch", lambda self, task, repo_files, failed_tests: next(responses))
+    created = client.post(f"/api/v1/tasks/{task['task_id']}/repairs", json={
+        "parent_candidate_id": parent["candidate_id"], "finding_ids": [finding["finding_id"]],
+        "max_budget": 2, "actor": "maintainer", "approved": True,
+        "repo_files": {"calc.py": "def add(a, b):\n    return a + b\n"},
+    })
+    assert created.status_code == 202
+    body = created.json()
+    assert body["status"] == "completed"
+    assert body["budget_used"] == 2
+    assert body["attempt_errors"][0]["code"] == "repair_protocol_error"
+    events = client.get(f"/api/v1/jobs/{body['job_id']}/events").text
+    assert "repair_attempt_started" in events
+    assert "repair_attempt_failed" in events
+    assert "repair_attempt_succeeded" in events
+
+
 def test_findings_keep_baseline_failure_and_inconclusive_outcomes(tmp_path):
     """Derivation records each non-pass observation without claiming success."""
     from patchpilot.domain.entities import (
