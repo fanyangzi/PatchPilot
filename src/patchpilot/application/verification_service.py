@@ -421,6 +421,11 @@ class VerificationService:
         self.store.save_verification(result)
         for item in checks:
             self.store.save_check_execution(item)
+        # Materialize a durable, conservative finding projection from the
+        # exact immutable snapshot and measured checks.  This call is
+        # idempotent: retries reuse deterministic finding IDs and never alter
+        # an earlier verification's history.
+        findings = self.store.derive_findings_for_verification(result_id)
         link_payload.update({"result_verification_id": result_id, "verdict": verdict.value, "gaps": list(result.gaps)})
         self._save_link(execution_id, verification_id, result_id, run_state.value, link_payload)
         return {
@@ -428,6 +433,7 @@ class VerificationService:
             "source_verification_id": verification_id,
             "verification": result.to_dict(),
             "checks": [item.to_dict() for item in checks],
+            "findings": [item.to_dict() for item in findings],
         }
 
 

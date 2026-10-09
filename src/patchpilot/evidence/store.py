@@ -556,6 +556,13 @@ class EvidenceStore:
         candidates = self.list_candidates(task_id)
         for candidate in candidates:
             for verification in self.list_verifications(candidate_id=candidate.candidate_id):
+                # The initial queued verification is a request for work, not
+                # an observed execution.  Do not manufacture a ``not_run``
+                # finding for it; incomplete state is surfaced by the API's
+                # explicit ``complete=false`` response until a worker writes
+                # a result snapshot or a measured check.
+                if verification.run_state in {RunState.DRAFT, RunState.QUEUED, RunState.RUNNING} and not self.list_check_executions(verification.verification_id):
+                    continue
                 self.derive_findings_for_verification(verification.verification_id)
         return self.list_findings(task_id)
 

@@ -173,7 +173,9 @@ def test_inbox_and_findings_use_explicit_empty_or_actionable_states(api_client):
     assert inbox["items"][0]["next_action"] == "import_candidate"
     findings = client.get(f"/api/v1/tasks/{task['task_id']}/findings").json()
     assert findings["items"] == []
-    assert findings["available"] is False
+    assert findings["available"] is True
+    assert findings["complete"] is False
+    assert "no verification" in findings["reason"]
 
 
 def test_intake_rejects_local_paths_private_urls_and_missing_source(api_client):
@@ -309,6 +311,79 @@ def test_execute_runs_base_and_candidate_in_real_temporary_git_repo(api_client, 
     assert len(checks.json()["items"]) == 2
     assert api.store.get_verification(queued["verification_id"]).run_state.value == "queued"
     assert api.store.get_verification(result["verification_id"]).verdict.value == "accepted_within_scope"
+
+
+def test_execution_persists_traceable_candidate_failure_finding(api_client, tmp_path, monkeypatch):
+    client, _ = api_client
+    repo, base_sha, _ = _temporary_git_repository(tmp_path)
+    # Replace the harmless instrumentation patch with a real regression.  The
+    # pinned base remains green while the candidate makes the test fail.
+    subprocess.run(["git", "checkout", "--", "calc.py"], cwd=repo, check=True)
+    (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    bad_patch = subprocess.check_output(["git", "diff", "--", "calc.py"], cwd=repo, text=True)
+    monkeypatch.setenv("PATCHPILOT_WORKSPACE_ROOTS", str(tmp_path))
+    queued, task, _, _ = _queue_verification_for_execution(client, base_sha, bad_patch)
+
+    executed = client.post(
+        f"/api/v1/verifications/{queued['verification_id']}/execute",
+        json={"repo_path": str(repo), "command_argv": [["pytest", "-q"]], "suite_id": "pytest-default"},
+    )
+    assert executed.status_code == 201
+    payload = executed.json()
+    # A failed command is persisted as an observed finding; without a
+    # condition-mapped oracle/repeat proof it remains inconclusive.
+    assert payload["verification"]["verdict"] == "inconclusive"
+    assert payload["findings"]
+    assert any(item["kind"] == "candidate_failure" for item in payload["findings"])
+
+    listed = client.get(f"/api/v1/tasks/{task['task_id']}/findings")
+    assert listed.status_code == 200
+    body = listed.json()
+    assert body["available"] is True and body["complete"] is True
+    candidate_findings = [item for item in body["items"] if item["kind"] == "candidate_failure"]
+    assert len(candidate_findings) == 1
+    finding = candidate_findings[0]
+    assert finding["status"] == "observed"
+    assert finding["source_variant"] == "candidate"
+    assert finding["verification_id"] == payload["verification"]["verification_id"]
+    assert finding["check_ids"] and finding["evidence_refs"]
+    detail = client.get(f"/api/v1/findings/{finding['finding_id']}")
+    assert detail.status_code == 200
+    assert detail.json()["finding"]["finding_id"] == finding["finding_id"]
+
+
+def test_findings_keep_baseline_failure_and_inconclusive_outcomes(tmp_path):
+    """Derivation records each non-pass observation without claiming success."""
+    from patchpilot.domain.entities import (
+        Candidate, CheckExecution, ContractVersion, Finding, ReviewDecision,
+        RunState, Task, Verification, Verdict, Validity, AcceptanceCondition,
+        ContractState,
+    )
+    from patchpilot.evidence.store import EvidenceStore
+
+    store = EvidenceStore(tmp_path)
+    task = Task("task-findings", {"title": "finding derivation"})
+    store.save_task(task)
+    candidate = Candidate("candidate-findings", task.task_id, "base-sha", None, "tree", "patch", "upload")
+    store.save_candidate(candidate)
+    contract = ContractVersion(
+        "contract-findings", task.task_id, 1, ContractState.FROZEN,
+        (AcceptanceCondition("AC-1", "preserve", "keep behavior", ("issue:1",), True, "maintainer_confirmed", {"type": "pytest"}),),
+        ("issue:1",),
+    )
+    store.save_contract_version(contract)
+    key = "findings-verification-key"
+    verification = Verification("verification-findings", key, candidate.candidate_id, contract.contract_id, RunState.COMPLETED, Verdict.INCONCLUSIVE, 1, Validity.CURRENT, ReviewDecision.PENDING, ("incomplete_check_execution",), ())
+    store.save_verification(verification)
+    for check_id, variant, outcome in (("check-base", "base", "fail"), ("check-candidate-flaky", "candidate", "flaky"), ("check-candidate-not-run", "candidate", "not_run"), ("check-candidate-error", "candidate", "error")):
+        store.save_check_execution(CheckExecution(check_id, verification.verification_id, "suite", check_id, variant, outcome, 0, details={"reason": outcome}))
+
+    findings = store.derive_findings_for_verification(verification.verification_id)
+    kinds = {item.kind for item in findings}
+    assert {"baseline_failure", "flaky", "not_run", "candidate_error"}.issubset(kinds)
+    assert all(item.verification_id == verification.verification_id for item in findings)
+    assert all(item.repeats == 1 for item in findings)
+    assert store.list_findings(task.task_id) == findings
 
 
 def test_execute_reports_error_state_when_workspace_is_not_allowlisted(api_client):

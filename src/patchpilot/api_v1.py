@@ -537,6 +537,15 @@ class _ResourceStore:
         data["response"] = json.loads(data["response"])
         return data
 
+    def get_publication_by_id(self, publication_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.db.execute("SELECT * FROM api_publications WHERE publication_id=?", (publication_id,)).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        data["response"] = json.loads(data["response"])
+        return data
+
 
 def _evidence_store():
     # Delayed import prevents the existing app module's store construction from
@@ -1030,15 +1039,35 @@ def list_findings(task_id: str, request: Request, candidate_id: str | None = Non
         candidate = store.get_candidate(candidate_id)
         if not candidate or candidate.task_id != task_id:
             raise APIError(404, "candidate_not_found", "candidate does not exist for this task")
-    # Findings are written only by the evidence-producing verification worker.
-    # There is no worker in this phase, so the API marks collection unavailable
-    # rather than silently presenting an unsupported pipeline as a clean result.
-    return _result(request, {"items": [], "available": False, "complete": False, "reason": "finding execution pipeline is not implemented"})
+    # The projection is rebuilt from immutable verifications/checks on every
+    # read.  Derivation is idempotent and therefore also repairs a database
+    # created before the findings table was introduced, without inventing a
+    # result or turning an empty queue into a successful run.
+    store.ensure_findings_for_task(task_id)
+    items = store.list_findings(task_id, candidate_id=candidate_id, condition_id=condition_id)
+    candidates = store.list_candidates(task_id)
+    verifications = [verification for candidate in candidates for verification in store.list_verifications(candidate.candidate_id)]
+    check_count = sum(len(store.list_check_executions(verification.verification_id)) for verification in verifications)
+    complete = bool(verifications and check_count)
+    reason = None
+    if not verifications:
+        reason = "no verification has produced evidence yet"
+    elif not check_count:
+        reason = "verification is queued but has no persisted check execution yet"
+    return _result(request, {
+        "items": [item.to_dict() for item in items],
+        "available": True,
+        "complete": complete,
+        **({"reason": reason} if reason else {}),
+    })
 
 
 @router.get("/findings/{finding_id}")
 def get_finding(finding_id: str, request: Request):
-    raise APIError(404, "finding_not_found", "finding does not exist or has not been produced by a verification worker")
+    finding = _evidence_store().get_finding(finding_id)
+    if not finding:
+        raise APIError(404, "finding_not_found", "finding does not exist or is not visible")
+    return _result(request, {"finding": finding.to_dict()})
 
 
 @router.get("/tasks/{task_id}/reports")
@@ -1341,6 +1370,14 @@ def publish_report(report_id: str, body: PublishCreate, request: Request):
         # reconcile the external_id, avoiding duplicate comments.
         raise APIError(500, "publication_persistence_failed", "publication completed remotely but could not be recorded locally") from exc
     return _result(request, {"publication": _publication_public_dict(publication), "status": "published"}, 202)
+
+
+@router.get("/publications/{publication_id}")
+def get_publication(publication_id: str, request: Request):
+    publication = _resources().get_publication_by_id(publication_id)
+    if not publication:
+        raise APIError(404, "publication_not_found", "publication does not exist or is not visible")
+    return _result(request, {"publication": _publication_public_dict(publication)})
 
 
 @router.get("/contracts/{contract_id}")
