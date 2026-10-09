@@ -37,4 +37,6 @@ artifacts/model_plans/
 node_modules/
 .venv/
 dist/
+apps/console/test-results/
+apps/console/playwright-report/
 apps/console/tsconfig.tsbuildinfo
