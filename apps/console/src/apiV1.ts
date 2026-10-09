@@ -60,6 +60,31 @@ export type Finding = { finding_id?: string; kind?: string; status?: string; tit
 export type ProbeCase = { value: unknown; label: string; input_hash: string };
 export type ReportMeta = { report_id: string; task_id: string; verification_id: string; verification_key: string; format: 'markdown' | 'html'; content_type: string; content_sha: string; created_at: string };
 export type Report = ReportMeta & { snapshot: { task: Task; candidate: Candidate; contract: Contract; verification: Verification; scope_statement?: string; generated_at?: string } };
+export type EvidenceGraphNode = {
+  id: string;
+  type: string;
+  label: string;
+  status?: string | null;
+  refs?: string[];
+  meta?: Record<string, unknown>;
+};
+export type EvidenceGraphEdge = {
+  id: string;
+  source: string;
+  target: string;
+  type: string;
+  label?: string | null;
+};
+export type EvidenceGraph = {
+  task_id: string;
+  focus?: string | null;
+  depth: number;
+  nodes: EvidenceGraphNode[];
+  edges: EvidenceGraphEdge[];
+  summary: { node_count: number; edge_count: number; counts: Record<string, number> };
+  truncated: boolean;
+  request_id?: string;
+};
 
 const json = (value: unknown) => JSON.stringify(value);
 export const v1 = {
@@ -67,6 +92,13 @@ export const v1 = {
   inbox: () => request<{ items: InboxItem[]; total: number; request_id: string }>('/inbox'),
   tasks: () => request<{ items: Task[]; total: number; next_cursor?: string | null }>('/tasks?limit=500'),
   task: (id: string) => request<{ task: Task; candidates: Candidate[]; contracts: Contract[]; latest_verification: Verification | null }>(`/tasks/${enc(id)}`),
+  taskGraph: (id: string, options?: { focus?: string; depth?: number; limit?: number }) => {
+    const params = new URLSearchParams();
+    if (options?.focus) params.set('focus', options.focus);
+    if (options?.depth != null) params.set('depth', String(options.depth));
+    if (options?.limit != null) params.set('limit', String(options.limit));
+    return request<EvidenceGraph>(`/tasks/${enc(id)}/graph${params.toString() ? `?${params}` : ''}`);
+  },
   candidates: (taskId: string) => request<{ items: Candidate[] }>(`/tasks/${enc(taskId)}/candidates`),
   candidateDiff: (id: string) => request<{ candidate_id: string; patch_hash: string; content?: string | null; content_ref?: string | null; available: boolean }>(`/candidates/${enc(id)}/diff`),
   contracts: (taskId: string) => request<{ items: Contract[] }>(`/tasks/${enc(taskId)}/contracts`),

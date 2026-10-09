@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Activity, ArrowDownRight, ArrowRight, ArrowUpRight, BookOpenCheck, Check, CircleAlert, ClipboardCheck, Download, FileSearch, FileText, GitBranch, GitCommitHorizontal, GitPullRequest, LoaderCircle, Plus, RefreshCw, ShieldAlert, ShieldCheck, SquareArrowOutUpRight, X } from 'lucide-react';
-import { V1Error, v1, type Candidate, type Check as CheckItem, type Condition, type Contract, type InboxItem, type Task, type Verification } from '../apiV1';
+import { V1Error, v1, type Candidate, type Check as CheckItem, type Condition, type Contract, type EvidenceGraph, type InboxItem, type Task, type Verification } from '../apiV1';
 import { go, href, type Route } from '../ui';
 
 type Remote<T> = { data?: T; error?: string; loading: boolean; reload: () => void };
@@ -95,6 +95,24 @@ function fourStatus(verification?: Verification | null) {
   return <div className="ac-four"><Status label="运行状态" value={verification.run_state} tone={stateTone(verification.run_state)} /><Status label="结论" value={verification.verdict} tone={stateTone(verification.verdict)} /><Status label="有效性" value={verification.validity} tone={stateTone(verification.validity)} /><Status label="维护者决策" value={verification.review_decision} tone={stateTone(verification.review_decision)} /></div>;
 }
 
+const GRAPH_TYPE_LABELS: Record<string, string> = {
+  task: '任务', source: '来源', candidate: '候选', contract: '合同', condition: '条件',
+  verification: '验证', check: '检查', finding: '反例', artifact: '证据',
+};
+
+function EvidenceGraphPanel({ graph, loading, error, onRetry }: { graph?: EvidenceGraph; loading: boolean; error?: string; onRetry: () => void }) {
+  return <section className="ac-sheet ac-graph-panel" aria-labelledby="evidence-graph-title">
+    <div className="ac-section-title"><div><GitBranch size={16} /><h2 id="evidence-graph-title">证据关系图</h2></div><span>{graph ? `${graph.summary.node_count} 节点 · ${graph.summary.edge_count} 条关系` : '任务来源 → 候选 → 合同 → 验证'}</span></div>
+    <p className="ac-note">把当前任务的来源、候选、验收合同、逐项检查和证据串成可追溯链。节点状态来自服务端持久化记录，缺失资源保持显式缺口。</p>
+    <RemoteState loading={loading} error={error} empty={!loading && !error && !graph?.nodes.length ? '服务端尚未生成该任务的证据图。' : undefined} onRetry={onRetry} />
+    {graph && graph.nodes.length > 0 && <>
+      <div className="ac-graph-summary">{Object.entries(graph.summary.counts).map(([type, count]) => <span key={type}><b>{count}</b>{GRAPH_TYPE_LABELS[type] || type}</span>)}{graph.truncated && <span className="ac-graph-truncated">已按上限截断</span>}</div>
+      <div className="ac-graph-nodes">{graph.nodes.map((node) => <article className="ac-graph-node" key={node.id}><div className="ac-graph-node-head"><span className="ac-graph-type">{GRAPH_TYPE_LABELS[node.type] || node.type}</span>{node.status && <Status label="状态" value={node.status} tone={stateTone(node.status)} />}</div><strong title={node.label}>{node.label}</strong><code>{node.id}</code>{node.refs?.length ? <SourceRefs refs={node.refs.slice(0, 2)} /> : null}</article>)}</div>
+      {graph.edges.length > 0 && <div className="ac-graph-edges"><span className="ac-label">关系链</span>{graph.edges.slice(0, 24).map((edge) => <span key={edge.id}><code>{edge.source}</code><ArrowRight size={12} /><code>{edge.target}</code>{edge.label || edge.type ? <small>{edge.label || edge.type}</small> : null}</span>)}</div>}
+    </>}
+  </section>;
+}
+
 export function AcceptanceInboxPage({ routeId, onImport }: { routeId?: string; onImport?: () => void }) {
   const inbox = useRemote('inbox', () => v1.inbox());
   const rows = inbox.data?.items || [];
@@ -166,6 +184,7 @@ export function CodeReviewPage({ routeId, candidateId: routeCandidateId, contrac
   const [decision, setDecision] = useState<'accepted' | 'rejected' | 'exception_accepted'>('accepted'); const [decisionReason, setDecisionReason] = useState('');
   const [busy, setBusy] = useState(''); const [actionError, setActionError] = useState(''); const [toast, setToast] = useState('');
   const current = task.data?.task; const candidates = task.data?.candidates || [];
+  const graph = useRemote(`task-graph:${selected}`, () => selected ? v1.taskGraph(selected, { depth: 2, limit: 200 }) : Promise.reject(new Error('请选择一个任务')));
   const setCandidateId = (value: string) => {
     setCandidateIdState(value);
     if (selected && value) go({ page: 'review', id: selected, candidateId: value, contractId: routeContractId, checkId: routeCheckId });
@@ -215,6 +234,7 @@ export function CodeReviewPage({ routeId, candidateId: routeCandidateId, contrac
       <RemoteState loading={task.loading} error={task.error} onRetry={task.reload} />
       {current && <>
         <div className="ac-source-banner"><div><span className="ac-label">问题来源</span><h2>{taskTitle(current)}</h2><p>{current.issue_snapshot.repo_id} <span>·</span> 基线 <code>{current.issue_snapshot.base_ref || '未解析'}</code></p></div><SourceRefs refs={current.source_refs} /></div>
+        <EvidenceGraphPanel graph={graph.data} loading={graph.loading} error={graph.error} onRetry={graph.reload} />
         <div className="ac-review-grid"><section className="ac-sheet ac-diff-sheet"><div className="ac-section-title"><div><GitBranch size={16} /><h2>候选补丁差异</h2></div><label className="ac-inline-control"><span className="sr-only">切换候选补丁</span><select aria-label="切换候选补丁" value={candidateId} onChange={(e) => setCandidateId(e.target.value)}><option value="">选择候选</option>{candidates.map((c) => <option key={c.candidate_id} value={c.candidate_id}>{c.candidate_id.slice(0, 25)} · {c.author_type}</option>)}</select></label></div>
           {!candidates.length ? <div className="ac-state ac-state-empty">此任务暂无候选补丁记录。</div> : <><div className="ac-candidate-meta"><span>候选 <code>{candidate?.candidate_id}</code></span><span>基线 <code>{candidate?.base_sha}</code></span><span>内容 SHA256 <code>{candidate?.patch_hash}</code></span></div><RemoteState loading={diff.loading} error={diff.error} empty={!diff.loading && !diff.error && !diff.data?.available ? `补丁内容未提供给 API（${diff.data?.content_ref || '无可读取的 content ref'}）；仅显示服务端保存的摘要。` : undefined} onRetry={diff.reload} />{diff.data?.available && diff.data.content && <pre className="ac-code"><code>{diff.data.content}</code></pre>}</>}
         </section>
