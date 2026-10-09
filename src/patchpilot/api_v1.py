@@ -15,6 +15,7 @@ through ``EvidenceStore`` so API and CLI share the same immutable records.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -22,8 +23,9 @@ import platform
 import re
 import threading
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, FastAPI, Request
@@ -61,6 +63,8 @@ router = APIRouter(prefix="/api/v1", tags=["v1"])
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,199}$")
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _MAX_PATCH_BYTES = 2 * 1024 * 1024
+_MAX_PUBLICATION_BODY_BYTES = 512 * 1024
+_PUBLICATION_PREVIEW_TTL_SECONDS = 10 * 60
 
 
 class APIError(Exception):
@@ -292,6 +296,69 @@ class DecisionCreate(APIModel):
     actor: str = "maintainer"
 
 
+class PublishPreviewCreate(APIModel):
+    """Inputs for the side-effect preview shown before a GitHub write.
+
+    ``repo_id``/``pr_number``/``head_sha`` are accepted as ergonomic aliases
+    for clients that use the same names as intake/candidate resources.  The
+    normalized response always uses ``target_repo``, ``target_pr`` and
+    ``expected_head``.
+    """
+
+    target_repo: str | None = None
+    repo_id: str | None = None
+    target_pr: int | None = Field(default=None, ge=1)
+    pr_number: int | None = Field(default=None, ge=1)
+    expected_head: str | None = None
+    head_sha: str | None = None
+    publication_type: Literal["comment"] = "comment"
+
+    @model_validator(mode="after")
+    def normalize_target(self):
+        repo = self.target_repo or self.repo_id
+        number = self.target_pr or self.pr_number
+        head = self.expected_head or self.head_sha
+        if not repo:
+            raise ValueError("target_repo is required")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}", repo):
+            raise ValueError("target_repo must be owner/name")
+        if number is None:
+            raise ValueError("target_pr is required")
+        if not head or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}", head):
+            raise ValueError("expected_head must be a non-empty commit identifier")
+        self.target_repo = repo
+        self.target_pr = number
+        self.expected_head = head
+        return self
+
+
+class PublishCreate(APIModel):
+    preview_id: str
+    expected_head: str | None = None
+    head_sha: str | None = None
+    confirmation_digest: str
+
+    @field_validator("preview_id")
+    @classmethod
+    def validate_preview_id(cls, value: str) -> str:
+        return _valid_id(value, "preview_id")
+
+    @field_validator("confirmation_digest")
+    @classmethod
+    def validate_confirmation_digest(cls, value: str) -> str:
+        if not re.fullmatch(r"[a-fA-F0-9]{64}", value):
+            raise ValueError("confirmation_digest must be a SHA-256 digest")
+        return value.lower()
+
+    @model_validator(mode="after")
+    def normalize_head(self):
+        head = self.expected_head or self.head_sha
+        if not head or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}", head):
+            raise ValueError("expected_head is required")
+        self.expected_head = head
+        return self
+
+
 class _ResourceStore:
     """Durable metadata access sharing EvidenceStore's connection and lock."""
 
@@ -321,10 +388,29 @@ class _ResourceStore:
                   format TEXT NOT NULL, content_type TEXT NOT NULL,
                   content TEXT NOT NULL, content_sha TEXT NOT NULL,
                   snapshot TEXT NOT NULL, created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS api_publication_previews(
+                  preview_id TEXT PRIMARY KEY, report_id TEXT NOT NULL,
+                  target_repo TEXT NOT NULL, target_pr INTEGER NOT NULL,
+                  expected_head TEXT NOT NULL, publication_type TEXT NOT NULL,
+                  body TEXT NOT NULL, body_digest TEXT NOT NULL,
+                  confirmation_digest TEXT NOT NULL, current_head TEXT NOT NULL,
+                  expires_at TEXT NOT NULL, created_at TEXT NOT NULL,
+                  status TEXT NOT NULL, target_snapshot TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS api_publications(
+                  publication_id TEXT PRIMARY KEY, preview_id TEXT NOT NULL UNIQUE,
+                  report_id TEXT NOT NULL, target_repo TEXT NOT NULL,
+                  target_pr INTEGER NOT NULL, expected_head TEXT NOT NULL,
+                  body_digest TEXT NOT NULL, status TEXT NOT NULL,
+                  external_id TEXT, external_url TEXT, response TEXT NOT NULL,
+                  created_at TEXT NOT NULL);
                 CREATE TRIGGER IF NOT EXISTS immutable_api_reports_update
                   BEFORE UPDATE ON api_reports BEGIN SELECT RAISE(ABORT, 'immutable report'); END;
                 CREATE TRIGGER IF NOT EXISTS immutable_api_reports_delete
                   BEFORE DELETE ON api_reports BEGIN SELECT RAISE(ABORT, 'immutable report'); END;
+                CREATE TRIGGER IF NOT EXISTS immutable_api_publication_previews_update
+                  BEFORE UPDATE ON api_publication_previews BEGIN SELECT RAISE(ABORT, 'immutable publication preview'); END;
+                CREATE TRIGGER IF NOT EXISTS immutable_api_publication_previews_delete
+                  BEFORE DELETE ON api_publication_previews BEGIN SELECT RAISE(ABORT, 'immutable publication preview'); END;
                 """
             )
             self.db.commit()
@@ -406,6 +492,51 @@ class _ResourceStore:
             values.append(data)
         return values
 
+    def save_publication_preview(self, payload: dict[str, Any]) -> None:
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO api_publication_previews VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    payload["preview_id"], payload["report_id"], payload["target_repo"],
+                    payload["target_pr"], payload["expected_head"], payload["publication_type"],
+                    payload["body"], payload["body_digest"], payload["confirmation_digest"],
+                    payload["current_head"], payload["expires_at"], payload["created_at"],
+                    payload["status"], self._json(payload["target_snapshot"]),
+                ),
+            )
+            self.db.commit()
+
+    def get_publication_preview(self, preview_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.db.execute("SELECT * FROM api_publication_previews WHERE preview_id=?", (preview_id,)).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        data["target_snapshot"] = json.loads(data["target_snapshot"])
+        return data
+
+    def save_publication(self, payload: dict[str, Any]) -> None:
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO api_publications VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    payload["publication_id"], payload["preview_id"], payload["report_id"],
+                    payload["target_repo"], payload["target_pr"], payload["expected_head"],
+                    payload["body_digest"], payload["status"], payload.get("external_id"),
+                    payload.get("external_url"), self._json(payload.get("response") or {}), payload["created_at"],
+                ),
+            )
+            self.db.commit()
+
+    def get_publication(self, preview_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.db.execute("SELECT * FROM api_publications WHERE preview_id=?", (preview_id,)).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        data["response"] = json.loads(data["response"])
+        return data
+
 
 def _evidence_store():
     # Delayed import prevents the existing app module's store construction from
@@ -424,7 +555,7 @@ def _github_source_resolver() -> GitHubSourceResolver:
     Tests and embedding applications may replace this factory with an injected
     resolver.  The default resolver reads ``GITHUB_TOKEN`` but never returns it.
     """
-    return GitHubSourceResolver()
+    return GitHubSourceResolver(allow_write=os.getenv("PATCHPILOT_GITHUB_ALLOW_WRITE", "0") == "1")
 
 
 def _rid(request: Request) -> str:
@@ -1028,6 +1159,188 @@ def get_report_content(report_id: str, request: Request):
         "content": report["content"],
         "content_sha": report["content_sha"],
     }, 200)
+
+
+def _publication_error(exc: SourceResolutionError) -> APIError:
+    """Map GitHub transport errors to stable, secret-free API errors."""
+    if exc.code in {"invalid_publication_target", "invalid_source_url"}:
+        return APIError(422, exc.code, exc.message)
+    if exc.code == "stale_head":
+        return APIError(409, "stale_head", exc.message)
+    if exc.code in {"github_forbidden", "github_write_forbidden", "github_auth_not_configured", "github_write_disabled"}:
+        return APIError(403, exc.code, exc.message)
+    if exc.code in {"github_not_found"}:
+        return APIError(404, exc.code, exc.message)
+    if exc.code in {"github_unavailable", "source_unavailable", "github_permission_unavailable"}:
+        return APIError(503, exc.code, exc.message, {"retryable": exc.retryable})
+    return APIError(502, exc.code, exc.message, {"retryable": exc.retryable})
+
+
+def _publication_confirmation_digest(*, preview_id: str, report_id: str, target_repo: str, target_pr: int, expected_head: str, body_digest: str) -> str:
+    value = {
+        "preview_id": preview_id,
+        "report_id": report_id,
+        "target_repo": target_repo,
+        "target_pr": target_pr,
+        "expected_head": expected_head,
+        "body_digest": body_digest,
+    }
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _publication_public_dict(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "publication_id": row["publication_id"],
+        "preview_id": row["preview_id"],
+        "report_id": row["report_id"],
+        "target_repo": row["target_repo"],
+        "target_pr": row["target_pr"],
+        "expected_head": row["expected_head"],
+        "body_digest": row["body_digest"],
+        "status": row["status"],
+        "external_id": row.get("external_id"),
+        "external_url": row.get("external_url"),
+        "auto_merge": False,
+        "created_at": row["created_at"],
+    }
+
+
+@router.post("/reports/{report_id}/publish-preview")
+def create_publication_preview(report_id: str, body: PublishPreviewCreate, request: Request):
+    """Create a short-lived, side-effect-free GitHub publication preview.
+
+    The target PR head is read immediately and must equal the caller's
+    expected head.  The resulting digest binds the exact report body and
+    target; a later publish request cannot substitute either value.
+    """
+    report = _resources().get_report(report_id)
+    if not report:
+        raise APIError(404, "report_not_found", "report does not exist or is not visible")
+    snapshot_verification = (report.get("snapshot") or {}).get("verification") or {}
+    if snapshot_verification.get("validity") == Validity.STALE.value:
+        raise APIError(409, "report_stale", "stale reports cannot be published; create a new verification")
+    report_body = str(report.get("content") or "")
+    if not report_body:
+        raise APIError(409, "report_content_unavailable", "report has no publishable content")
+    if len(report_body.encode("utf-8")) > _MAX_PUBLICATION_BODY_BYTES:
+        raise APIError(413, "publication_body_too_large", "report content exceeds the GitHub publication limit")
+    resolver = _github_source_resolver()
+    try:
+        target = resolver.current_pull_request(body.target_repo or "", body.target_pr or 0)
+    except SourceResolutionError as exc:
+        raise _publication_error(exc) from exc
+    if target["head_sha"] != body.expected_head:
+        raise APIError(409, "stale_head", "GitHub pull request head does not match the requested preview", {"expected_head": body.expected_head, "current_head": target["head_sha"]})
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=_PUBLICATION_PREVIEW_TTL_SECONDS)
+    body_digest = hashlib.sha256(report_body.encode("utf-8")).hexdigest()
+    preview_id = f"preview_{uuid.uuid4().hex}"
+    confirmation_digest = _publication_confirmation_digest(
+        preview_id=preview_id,
+        report_id=report_id,
+        target_repo=body.target_repo or "",
+        target_pr=body.target_pr or 0,
+        expected_head=body.expected_head or "",
+        body_digest=body_digest,
+    )
+    created_at = now.isoformat().replace("+00:00", "Z")
+    expires = expires_at.isoformat().replace("+00:00", "Z")
+    preview = {
+        "preview_id": preview_id,
+        "report_id": report_id,
+        "target_repo": body.target_repo,
+        "target_pr": body.target_pr,
+        "expected_head": body.expected_head,
+        "publication_type": body.publication_type,
+        "body": report_body,
+        "body_digest": body_digest,
+        "confirmation_digest": confirmation_digest,
+        "current_head": target["head_sha"],
+        "expires_at": expires,
+        "created_at": created_at,
+        "status": "previewed",
+        "target_snapshot": target,
+    }
+    _resources().save_publication_preview(preview)
+    return _result(request, {
+        "preview": {
+            "preview_id": preview_id,
+            "report_id": report_id,
+            "target_repo": body.target_repo,
+            "target_pr": body.target_pr,
+            "expected_head": body.expected_head,
+            "current_head": target["head_sha"],
+            "publication_type": body.publication_type,
+            "body": report_body,
+            "body_digest": body_digest,
+            "confirmation_digest": confirmation_digest,
+            "created_at": created_at,
+            "expires_at": expires,
+            "status": "previewed",
+            "side_effect": "create_pull_request_comment",
+            "auto_merge": False,
+        },
+    })
+
+
+@router.post("/reports/{report_id}/publish", status_code=202)
+def publish_report(report_id: str, body: PublishCreate, request: Request):
+    """Publish one explicitly confirmed report comment, never merge code."""
+    preview = _resources().get_publication_preview(body.preview_id)
+    if not preview or preview["report_id"] != report_id:
+        raise APIError(404, "publication_preview_not_found", "publication preview does not exist or is not visible")
+    existing = _resources().get_publication(body.preview_id)
+    if existing:
+        # A repeat of the same preview is safe and idempotent.  A different
+        # confirmation must never be allowed to alias an already published
+        # side effect.
+        if not hmac.compare_digest(existing["expected_head"], body.expected_head or "") or not hmac.compare_digest(existing["body_digest"], preview["body_digest"]):
+            raise APIError(409, "publication_conflict", "publication preview has already been used with different content")
+        return _result(request, {"publication": _publication_public_dict(existing), "idempotent_replay": True}, 202)
+    expires_at = datetime.fromisoformat(str(preview["expires_at"]).replace("Z", "+00:00"))
+    if datetime.now(timezone.utc) >= expires_at:
+        raise APIError(409, "publication_preview_expired", "publication preview has expired; create a new preview")
+    if not hmac.compare_digest(str(preview["expected_head"]), body.expected_head or ""):
+        raise APIError(409, "stale_head", "confirmation head does not match the preview head", {"expected_head": preview["expected_head"]})
+    if not hmac.compare_digest(str(preview["confirmation_digest"]), body.confirmation_digest):
+        raise APIError(409, "confirmation_digest_mismatch", "confirmation digest does not match the immutable preview")
+    report = _resources().get_report(report_id)
+    if not report:
+        raise APIError(404, "report_not_found", "report does not exist or is not visible")
+    snapshot_verification = (report.get("snapshot") or {}).get("verification") or {}
+    if snapshot_verification.get("validity") == Validity.STALE.value:
+        raise APIError(409, "report_stale", "stale reports cannot be published; create a new verification")
+    resolver = _github_source_resolver()
+    try:
+        result = resolver.publish_report_comment(
+            repo_id=str(preview["target_repo"]), number=int(preview["target_pr"]),
+            expected_head=str(preview["expected_head"]), body=str(preview["body"]),
+        )
+    except SourceResolutionError as exc:
+        raise _publication_error(exc) from exc
+    created_at = utc_now()
+    publication = {
+        "publication_id": f"publication_{uuid.uuid4().hex}",
+        "preview_id": preview["preview_id"],
+        "report_id": report_id,
+        "target_repo": preview["target_repo"],
+        "target_pr": preview["target_pr"],
+        "expected_head": preview["expected_head"],
+        "body_digest": preview["body_digest"],
+        "status": "published",
+        "external_id": result.get("external_id"),
+        "external_url": result.get("url"),
+        "response": result,
+        "created_at": created_at,
+    }
+    try:
+        _resources().save_publication(publication)
+    except Exception as exc:
+        # A successful remote write with a local persistence failure must not
+        # be retried automatically: callers need an operator-visible error to
+        # reconcile the external_id, avoiding duplicate comments.
+        raise APIError(500, "publication_persistence_failed", "publication completed remotely but could not be recorded locally") from exc
+    return _result(request, {"publication": _publication_public_dict(publication), "status": "published"}, 202)
 
 
 @router.get("/contracts/{contract_id}")
