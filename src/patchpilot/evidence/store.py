@@ -1,7 +1,8 @@
 from __future__ import annotations
 import json, hashlib, sqlite3, threading, time
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+import re
 from typing import Any, Mapping
 from ..domain import Event, Evidence, Artifact, Run
 from ..domain.models import compute_event_hash
@@ -723,13 +724,65 @@ class EvidenceStore:
             return [json.loads(row["payload"]) for row in rows]
 
     def write_artifact(self,run_id,kind,content:bytes,filename:str,metadata=None):
-        folder=self.root/run_id
+        """Write one immutable artifact and retain a run-scoped metadata link.
+
+        Artifact bytes may be content-identical across runs.  The old
+        ``art_<digest>`` primary key combined with ``INSERT OR REPLACE`` meant
+        that a later run silently replaced the earlier run's ``run_id`` and
+        metadata.  Evidence delivery needs content-addressable bytes *and*
+        independent run links, so the public artifact id now includes a safe
+        run component while retaining the full SHA-256 in the record.
+
+        ``filename`` is an internal artifact name, never a path.  Rejecting
+        separators, absolute paths, NULs, and dot segments prevents callers
+        from escaping ``root/<run_id>`` even if a future API exposes this
+        helper to uploads.
+        """
+        safe_run_id = self._safe_component(run_id, "run_id")
+        safe_filename = self._safe_filename(filename)
+        if not isinstance(content, (bytes, bytearray, memoryview)):
+            raise TypeError("artifact content must be bytes")
+        raw = bytes(content)
+        folder=self.root/safe_run_id
         with self._lock:
-            folder.mkdir(exist_ok=True)
-            path=folder/filename
-            path.write_bytes(content)
-        digest=hashlib.sha256(content).hexdigest(); aid=f"art_{digest[:12]}"
-        a=Artifact(aid,kind,str(path),digest,len(content),run_id,metadata or {}); self.add_artifact(a); return a
+            folder.mkdir(parents=True, exist_ok=True)
+            path=folder/safe_filename
+            # Refuse a pre-existing symlink.  ``Path.write_bytes`` follows one
+            # and could otherwise redirect evidence outside the artifact root.
+            if path.is_symlink():
+                raise ValueError("artifact filename resolves through a symbolic link")
+            path.write_bytes(raw)
+        digest=hashlib.sha256(raw).hexdigest()
+        # Keep IDs deterministic for retries within one run, but isolate the
+        # metadata row from identical content in another run.
+        aid=f"art_{safe_run_id}_{digest[:16]}"
+        a=Artifact(aid,kind,str(path),digest,len(raw),safe_run_id,metadata or {})
+        self.add_artifact(a)
+        return a
+
+    @staticmethod
+    def _safe_component(value: str, field: str) -> str:
+        if not isinstance(value, str) or not value or "\x00" in value:
+            raise ValueError(f"{field} must be a non-empty safe identifier")
+        if len(value) > 200 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", value):
+            raise ValueError(f"{field} contains an unsafe path component")
+        return value
+
+    @classmethod
+    def _safe_filename(cls, filename: str) -> str:
+        if not isinstance(filename, str) or not filename or "\x00" in filename:
+            raise ValueError("artifact filename must be non-empty")
+        # Check both POSIX and Windows interpretations so a Linux host does
+        # not accept a Windows traversal that becomes dangerous on export.
+        posix = PurePosixPath(filename)
+        windows = PureWindowsPath(filename)
+        if posix.is_absolute() or windows.is_absolute() or windows.drive:
+            raise ValueError("artifact filename must be relative")
+        if "/" in filename or "\\" in filename or any(part in {"", ".", ".."} for part in posix.parts):
+            raise ValueError("artifact filename must not contain path separators or dot segments")
+        if len(filename) > 200:
+            raise ValueError("artifact filename is too long")
+        return filename
 
     def close(self):
         with self._lock:

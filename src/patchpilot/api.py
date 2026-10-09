@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json, os, platform, re, time, uuid
 from pathlib import Path
+import errno
 
 from .domain import TaskSpec
 from .domain.models import Event, Run, compute_event_hash, compute_verdict_hash, stable_hash
@@ -21,7 +22,38 @@ TASK_ROOT = Path(os.getenv("PATCHPILOT_TASK_ROOT", ROOT / "fixtures" / "tasks"))
 store = EvidenceStore(ARTIFACT_ROOT)
 engine = PatchPilot(ARTIFACT_ROOT)
 app = FastAPI(title="PatchPilot API", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+def _allowed_origins() -> list[str]:
+    """Return explicit browser origins for the local console/API pair.
+
+    The previous wildcard CORS policy allowed any website to issue browser
+    requests to a running local API.  A comma-separated override keeps hosted
+    deployments configurable while the default only permits the two local
+    Vite origins used by the product.
+    """
+    raw = os.getenv("PATCHPILOT_ALLOWED_ORIGINS", "http://127.0.0.1:5173,http://localhost:5173")
+    return [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins(),
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "Last-Event-ID", "X-Request-ID", "X-PatchPilot-Workspace"],
+    allow_credentials=False,
+)
+
+
+@app.middleware("http")
+async def _security_headers(request, call_next):
+    """Apply browser hardening without changing JSON error semantics."""
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+    return response
 app.include_router(api_v1_router)
 install_api_v1(app)
 
@@ -199,11 +231,34 @@ def get_artifact_content(run_id: str, artifact_id: str):
     if not store.get_run(run_id): raise HTTPException(404,"run not found")
     record = next((a for a in store.list_artifacts(run_id) if a.get("artifact_id") == artifact_id), None)
     if not record: raise HTTPException(404,"artifact not found")
-    path = Path(record["path"]).resolve()
-    if not path.is_relative_to(ARTIFACT_ROOT.resolve()) or not path.is_file():
+    recorded_path = Path(record["path"])
+    # Registered artifact paths are trusted metadata, but the filesystem can
+    # change after registration.  Reject symlink components and re-check the
+    # resolved path immediately before reading to prevent an artifact link
+    # from becoming an arbitrary file download.
+    root = ARTIFACT_ROOT.resolve()
+    try:
+        path = recorded_path.resolve(strict=True)
+    except FileNotFoundError:
+        raise HTTPException(404, "artifact not readable")
+    if recorded_path.is_symlink() or any(part.is_symlink() for part in recorded_path.parents if part.exists()):
+        raise HTTPException(404, "artifact not readable")
+    if not path.is_relative_to(root) or not path.is_file():
         raise HTTPException(404,"artifact not readable")
-    raw = path.read_bytes()[:ARTIFACT_PREVIEW_BYTES]
-    return {"artifact_id": artifact_id, "name": path.name, "kind": record.get("kind"), "truncated": path.stat().st_size > ARTIFACT_PREVIEW_BYTES, "content": _safe_text(raw.decode("utf-8", errors="replace"))}
+    try:
+        # O_NOFOLLOW closes the common final-component symlink race on POSIX.
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            raw = os.read(fd, ARTIFACT_PREVIEW_BYTES)
+            stat = os.fstat(fd)
+        finally:
+            os.close(fd)
+    except (FileNotFoundError, NotADirectoryError, PermissionError, OSError) as exc:
+        if isinstance(exc, OSError) and exc.errno not in {errno.ELOOP, errno.ENOENT, errno.ENOTDIR, errno.EACCES, errno.EPERM}:
+            raise
+        raise HTTPException(404, "artifact not readable") from exc
+    return {"artifact_id": artifact_id, "name": path.name, "kind": record.get("kind"), "truncated": stat.st_size > ARTIFACT_PREVIEW_BYTES, "content": _safe_text(raw.decode("utf-8", errors="replace"))}
 
 @app.get("/api/tasks")
 def list_tasks():
