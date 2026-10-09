@@ -22,7 +22,7 @@ export function useAsync<T>(load: () => Promise<T>, deps: unknown[]) {
   return { ...state, reload };
 }
 
-/** URL routes: #/inbox, #/review/<task>, #/investigation/<task>, #/contract/<task>, #/report/<task>. Legacy run routes remain readable. */
+/** URL routes: /inbox, /review/<task>, /investigation/<task>, /contract/<task>, /report/<task>. Legacy hash links remain readable. */
 export type Route = {
   page: 'overview' | 'runs' | 'routing' | 'eval' | 'inspect' | 'policy' | 'inbox' | 'review' | 'investigation' | 'contract' | 'report';
   id?: string;
@@ -33,8 +33,11 @@ export type Route = {
   reportId?: string;
 };
 
-function parse(hash: string): Route {
-  const raw = hash.replace(/^#\/?/, '');
+function parse(pathname = location.pathname, search = location.search, hash = location.hash): Route {
+  // Read old hash links during migration, but emit and navigate with ordinary
+  // paths so a copied review URL remains useful outside the SPA session.
+  const legacyPath = hash.startsWith('#/') ? hash.slice(2) : '';
+  const raw = legacyPath || `${pathname.replace(/^\/+/, '')}${search}`;
   const [path, query = ''] = raw.split('?');
   const [page, id] = path.split('/');
   const params = new URLSearchParams(query);
@@ -50,11 +53,18 @@ function parse(hash: string): Route {
 }
 
 export function useRoute() {
-  const [route, setRoute] = useState(() => parse(location.hash));
+  const [route, setRoute] = useState(() => parse());
   useEffect(() => {
-    const on = () => { setRoute(parse(location.hash)); window.scrollTo({ top: 0 }); };
+    const on = () => {
+      // Convert bookmarks made by the previous hash router once, preserving
+      // the path and query while removing the fragment from the address bar.
+      if (location.hash.startsWith('#/')) history.replaceState({}, '', `${location.hash.slice(1)}`);
+      setRoute(parse()); window.scrollTo({ top: 0 });
+    };
+    addEventListener('popstate', on);
     addEventListener('hashchange', on);
-    return () => removeEventListener('hashchange', on);
+    on();
+    return () => { removeEventListener('popstate', on); removeEventListener('hashchange', on); };
   }, []);
   return route;
 }
@@ -66,9 +76,13 @@ export const href = (r: Route) => {
   if (r.checkId) params.set('check', r.checkId);
   if (r.reportId) params.set('report', r.reportId);
   const query = params.toString();
-  return `#/${r.page}${r.id ? `/${encodeURIComponent(r.id)}` : ''}${query ? `?${query}` : ''}`;
+  return `/${r.page}${r.id ? `/${encodeURIComponent(r.id)}` : ''}${query ? `?${query}` : ''}`;
 };
-export const go = (r: Route) => { location.hash = href(r); };
+export const go = (r: Route) => {
+  const target = href(r);
+  if (`${location.pathname}${location.search}` !== target) history.pushState({}, '', target);
+  dispatchEvent(new PopStateEvent('popstate'));
+};
 
 /** A ruled section head. Every section in the console is introduced this way. */
 export function Section({ icon: Icon, title, note, sub, children, className = '' }: {

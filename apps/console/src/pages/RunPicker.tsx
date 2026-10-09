@@ -1,7 +1,7 @@
 import { Activity, ArrowRight, BookOpenCheck, ScanSearch } from 'lucide-react';
 import type { RunRecord } from '../api';
 import { SCENARIO, secs, verdictOf, when } from '../model';
-import { Empty, Loading, Offline, go } from '../ui';
+import { Empty, Loading, Offline, go, href } from '../ui';
 
 /** Entry state for pages that need a concrete, sealed run.
  *
@@ -30,7 +30,7 @@ export function RunPicker({
   if (!runs?.length) {
     return <div className="g-entry-empty">
       <Empty>还没有可复核的运行记录。</Empty>
-      <a className="btn btn-primary" href="#/runs"><Activity size={14} />先运行一个任务</a>
+      <a className="btn btn-primary" href={href({ page: 'runs' })}><Activity size={14} />先运行一个任务</a>
     </div>;
   }
 
@@ -46,7 +46,7 @@ export function RunPicker({
     <section className="g-run-chooser" aria-label="选择运行记录">
       <div className="g-run-chooser-head">
         <div><strong>选择一条运行记录</strong><span>{runs.length} 条记录，按最近更新时间排列</span></div>
-        <a className="btn" href="#/runs">打开运行记录 <ArrowRight size={13} /></a>
+        <a className="btn" href={href({ page: 'runs' })}>打开运行记录 <ArrowRight size={13} /></a>
       </div>
       <ol className="g-run-options">
         {runs.map((run, index) => {
