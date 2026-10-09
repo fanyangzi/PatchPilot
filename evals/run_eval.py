@@ -30,6 +30,7 @@ from patchpilot.harness import Harness
 from patchpilot.orchestrator import PatchPilot
 
 METHODS = ("direct_llm", "linear_agent", "patchpilot_full")
+UNSAFE_LOCAL = os.getenv("PATCHPILOT_UNSAFE_LOCAL", "0").lower() in {"1", "true", "yes"}
 RESULT_FIELDS = [
     "task_id", "scenario", "commit", "method", "repeat", "run_id", "status",
     "reproduction_captured", "first_pass", "functional_repair", "trusted_delivery",
@@ -105,7 +106,14 @@ def apply_candidate_patch(workspace: Path, task: TaskSpec, attempt: int) -> None
 
 def run_tests(workspace: Path, task: TaskSpec) -> dict[str, Any]:
     command = str(task.constraints.get("test_command", "python3 -m pytest -q")).split()
-    result = Harness(str(workspace), timeout=int(task.risk_policy.get("max_runtime_sec", 30)), unsafe_local=False).run(command)
+    result = Harness(
+        str(workspace),
+        timeout=int(task.risk_policy.get("max_runtime_sec", 30)),
+        # Docker remains the default.  A local Mac without a running daemon
+        # can opt into a clearly labelled development replay instead of
+        # turning every row into an indistinguishable infrastructure failure.
+        unsafe_local=UNSAFE_LOCAL,
+    ).run(command)
     return {
         "command": result.command, "returncode": result.returncode, "stdout": result.stdout,
         "stderr": result.stderr, "duration_sec": result.duration_sec, "timed_out": result.timed_out,
@@ -199,12 +207,14 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         }
     return {
         "task_count": len({r["task_id"] for r in rows}), "method_count": len(grouped), "row_count": len(rows),
+        "execution_mode": "unsafe_local" if UNSAFE_LOCAL else "docker",
         "methods": methods, "task_ids": sorted({r["task_id"] for r in rows}),
         "limitations": [
             "The benchmark uses nine self-authored Python fixture task instances and pinned commits.",
             "direct_llm and linear_agent are deterministic local control policies, not claims about a specific hosted model.",
             "All percentages are task-level outcomes from this run; they do not establish external-repository generalization.",
             "PatchPilot's fixture provider is deterministic, so estimated model cost is zero for this benchmark.",
+            "unsafe_local mode runs commands on the host and is for local development; use Docker mode for isolated measurements.",
         ],
     }
 
