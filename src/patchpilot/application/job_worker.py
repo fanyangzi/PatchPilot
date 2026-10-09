@@ -17,6 +17,7 @@ from typing import Any, Callable, Mapping
 
 
 TERMINAL_STATES = frozenset({"completed", "cancelled", "error"})
+_EVENT_STATES = frozenset({"queued", "running", "awaiting_input", "completed", "cancelled", "error"})
 
 
 def utc_now() -> str:
@@ -177,7 +178,7 @@ class DurableJobStore:
                 )
                 self._append_event_unlocked(
                     data["job_id"],
-                    data["state"] if data["state"] in TERMINAL_STATES else "queued",
+                    data["state"] if data["state"] in _EVENT_STATES else "queued",
                     {"kind": data["kind"], "resource_id": data.get("resource_id")},
                 )
                 self.db.commit()

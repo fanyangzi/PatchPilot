@@ -76,6 +76,65 @@ class RemoteModel:
             'acceptance_checks': [str(x)[:160] for x in value.get('acceptance_checks', []) if isinstance(x, (str, int))][:8],
         }
 
+    @staticmethod
+    def _decode_json_object(raw: str) -> dict:
+        """Decode a bounded JSON object returned by an OpenAI-compatible API."""
+        text = (raw or "").strip()
+        if text.startswith('```'):
+            text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.I | re.S).strip()
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            start, end = text.find('{'), text.rfind('}')
+            if start < 0 or end <= start:
+                raise RuntimeError('remote planner returned non-JSON output')
+            value = json.loads(text[start:end + 1])
+        if not isinstance(value, dict):
+            raise RuntimeError('remote planner returned a non-object')
+        return value
+
+    def plan_contract(
+        self,
+        *,
+        task_id: str,
+        issue_title: str,
+        issue_body: str,
+        source_ids: list[str],
+        base_snapshot_id: str,
+    ) -> dict:
+        """Generate source-bound acceptance conditions without candidate data.
+
+        This is advisory planning only.  The API validates every condition and
+        source reference before persistence; model output never freezes a
+        contract or changes the deterministic verifier's standard.
+        """
+        sources = "\n".join(f"- {item}" for item in source_ids[:32])
+        prompt = (
+            "Return JSON only with keys conditions and ambiguities. "
+            "conditions is an array of objects with condition_id, kind, statement, "
+            "source_refs, required, and oracle. kind must be change, preserve, "
+            "constraint, or clarification. Use only the exact source IDs supplied. "
+            "Do not inspect or infer any candidate patch; do not produce shell commands.\n"
+            f"task_id: {task_id}\nbase_snapshot_id: {base_snapshot_id}\n"
+            f"issue_title: {issue_title[:500]}\nissue_body: {issue_body[:4000]}\n"
+            f"source_ids:\n{sources}\n"
+            "If the requirement is ambiguous, keep the condition required and add a "
+            "short explanation to ambiguities instead of inventing an expected result."
+        )
+        raw = self.chat([
+            {"role": "system", "content": "You draft source-bound acceptance contracts for PatchPilot."},
+            {"role": "user", "content": prompt},
+        ], temperature=0, json_mode=True)
+        value = self._decode_json_object(raw)
+        conditions = value.get("conditions")
+        ambiguities = value.get("ambiguities", [])
+        if not isinstance(conditions, list) or not isinstance(ambiguities, list):
+            raise RuntimeError("remote planner contract schema is invalid")
+        return {
+            "conditions": conditions[:64],
+            "ambiguities": [str(item)[:500] for item in ambiguities[:32] if isinstance(item, (str, int, float))],
+        }
+
     def propose_patch(self, task, repo_files: dict, failed_tests: list) -> str:
         files_ctx = '\n\n'.join(f'=== {p} ===\n{c[:2000]}' for p, c in list(repo_files.items())[:10])
         tests_ctx = 'Failed tests:\n' + '\n'.join(f'- {t}' for t in failed_tests[:10])

@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
+import time
 
 import pytest
 
@@ -165,6 +167,94 @@ def test_contract_versions_freeze_immutably_and_verification_is_not_assumed_pass
     assert "not_evaluated" in report_content.text
 
 
+def test_remote_contract_planner_is_source_bound_and_explicitly_recorded(api_client, monkeypatch):
+    client, _ = api_client
+    task = _create_task(client)
+    from patchpilot.adapters.remote import RemoteModel
+
+    captured = {}
+
+    def fake_plan(self, **kwargs):
+        captured.update(kwargs)
+        return {
+            "conditions": [{
+                "condition_id": "AC-REMOTE",
+                "kind": "preserve",
+                "statement": "Keep the imported behavior stable",
+                "source_refs": ["issue:remote"],
+                "required": True,
+                "oracle": {"type": "example", "expected": "stable"},
+            }],
+            "ambiguities": [],
+        }
+
+    monkeypatch.setattr(RemoteModel, "plan_contract", fake_plan)
+    response = client.post(f"/api/v1/tasks/{task['task_id']}/contracts/draft", json={
+        "source_ids": ["issue:remote"], "base_snapshot_id": "base-snapshot",
+        "model_profile": "remote",
+    })
+    assert response.status_code == 202
+    body = response.json()
+    assert body["model_called"] is True
+    assert body["model_status"] == "completed"
+    assert body["contract"]["conditions"][0]["condition_id"] == "AC-REMOTE"
+    assert captured["task_id"] == task["task_id"]
+    # Candidate content is intentionally not part of the planner input.
+    assert set(captured) == {"task_id", "issue_title", "issue_body", "source_ids", "base_snapshot_id"}
+    job = client.get(f"/api/v1/jobs/{body['job_id']}").json()["job"]
+    assert job["state"] == "completed"
+    assert client.get(f"/api/v1/jobs/{body['job_id']}/events").text.startswith("id: 1\nevent: completed")
+
+
+def test_remote_contract_planner_failure_stays_awaiting_input(api_client, monkeypatch):
+    client, _ = api_client
+    task = _create_task(client)
+    from patchpilot.adapters.remote import RemoteModel
+
+    monkeypatch.setattr(RemoteModel, "plan_contract", lambda self, **kwargs: (_ for _ in ()).throw(RuntimeError("provider unavailable")))
+    response = client.post(f"/api/v1/tasks/{task['task_id']}/contracts/draft", json={
+        "source_ids": ["issue:remote"], "base_snapshot_id": "base-snapshot",
+        "model_profile": "remote",
+    })
+    assert response.status_code == 202
+    body = response.json()
+    assert body["model_called"] is True
+    assert body["model_status"] == "error"
+    assert body["fallback"] == "manual_review"
+    assert body["contract"]["conditions"] == []
+    assert body["model_error"].startswith("RuntimeError:")
+    job = client.get(f"/api/v1/jobs/{body['job_id']}").json()["job"]
+    assert job["state"] == "awaiting_input"
+    assert "event: awaiting_input" in client.get(f"/api/v1/jobs/{body['job_id']}/events").text
+
+
+def test_remote_contract_planner_rejects_unknown_source_as_protocol_error(api_client, monkeypatch):
+    client, _ = api_client
+    task = _create_task(client)
+    from patchpilot.adapters.remote import RemoteModel
+
+    monkeypatch.setattr(RemoteModel, "plan_contract", lambda self, **kwargs: {
+        "conditions": [{
+            "condition_id": "AC-BAD",
+            "kind": "preserve",
+            "statement": "Invented source",
+            "source_refs": ["issue:not-supplied"],
+            "required": True,
+            "oracle": {"type": "example", "expected": "x"},
+        }],
+        "ambiguities": [],
+    })
+    response = client.post(f"/api/v1/tasks/{task['task_id']}/contracts/draft", json={
+        "source_ids": ["issue:remote"], "base_snapshot_id": "base-snapshot",
+        "model_profile": "remote",
+    })
+    assert response.status_code == 202
+    body = response.json()
+    assert body["model_status"] == "error"
+    assert body["fallback"] == "manual_review"
+    assert body["contract"]["conditions"] == []
+
+
 def test_inbox_and_findings_use_explicit_empty_or_actionable_states(api_client):
     client, _ = api_client
     task = _create_task(client)
@@ -311,6 +401,34 @@ def test_execute_runs_base_and_candidate_in_real_temporary_git_repo(api_client, 
     assert len(checks.json()["items"]) == 2
     assert api.store.get_verification(queued["verification_id"]).run_state.value == "queued"
     assert api.store.get_verification(result["verification_id"]).verdict.value == "accepted_within_scope"
+
+
+def test_execution_cancellation_kills_running_process_and_preserves_not_run_checks(api_client, tmp_path, monkeypatch):
+    client, api = api_client
+    repo, base_sha, patch = _temporary_git_repository(tmp_path)
+    monkeypatch.setenv("PATCHPILOT_WORKSPACE_ROOTS", str(tmp_path))
+    queued, _, _, _ = _queue_verification_for_execution(client, base_sha, patch)
+    from patchpilot.application.verification_service import VerificationService
+
+    started = time.monotonic()
+    service = VerificationService(api.store, timeout=10)
+
+    def cancel_checker():
+        return time.monotonic() - started > 0.25
+
+    result = service.execute(
+        queued["verification_id"], repo_path=repo,
+        command_argv=[[sys.executable, "-c", "import time; time.sleep(20)"]],
+        suite_id="cancel-suite", cancel_checker=cancel_checker,
+    )
+    verification = result["verification"]
+    assert verification["run_state"] == "cancelled"
+    assert verification["verdict"] == "inconclusive"
+    assert "cancelled" in verification["gaps"]
+    assert result["checks"] and all(item["outcome"] == "not_run" for item in result["checks"])
+    # Process-group termination should return promptly instead of waiting for
+    # the command's full sleep duration.
+    assert time.monotonic() - started < 5
 
 
 def test_execution_persists_traceable_candidate_failure_finding(api_client, tmp_path, monkeypatch):

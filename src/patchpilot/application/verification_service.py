@@ -20,13 +20,14 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import shutil
 import subprocess
 import tarfile
 import tempfile
 import time
 import uuid
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from ..domain.entities import (
     CheckExecution,
@@ -47,6 +48,20 @@ class WorkspaceResolutionError(ValueError):
 
 class VerificationExecutionError(RuntimeError):
     """An execution failed before a candidate result could be measured."""
+
+
+class VerificationCancelled(VerificationExecutionError):
+    """The caller cancelled a running command before it produced a result.
+
+    The partial stdout/stderr is retained by the caller as diagnostic context,
+    while the check itself is recorded as ``not_run``.  A cancellation is a
+    control-plane outcome, never a test failure or a successful result.
+    """
+
+    def __init__(self, message: str = "verification cancelled", *, stdout: str = "", stderr: str = ""):
+        super().__init__(message)
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 _SAFE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}$")
@@ -85,6 +100,11 @@ def _parse_results(stdout: str, stderr: str, return_code: int | None, timed_out:
         return CheckOutcome.ERROR, 0, {"reason": "timeout"}
     if "FLAKY" in combined.upper() or "RERUN" in combined.upper():
         return CheckOutcome.FLAKY, 0, {"reason": "runner reported rerun/flaky output"}
+    # Pytest exits with code 5 for an empty collection.  Treat that explicit
+    # signal as not_run rather than a generic environment error; both remain
+    # incomplete and therefore cannot satisfy an acceptance gate.
+    if re.search(r"\bno tests? ran\b|collected\s+0\s+items?", combined, re.IGNORECASE):
+        return CheckOutcome.NOT_RUN, 0, {"reason": "zero_test_cases"}
 
     counts: dict[str, int] = {}
     for match in _SUMMARY_RE.finditer(combined):
@@ -283,21 +303,70 @@ class VerificationService:
         if applied.returncode != 0:
             raise VerificationExecutionError("candidate patch application failed")
 
-    def _measure(self, workspace: Path, argv: tuple[str, ...]) -> CommandMeasurement:
+    @staticmethod
+    def _terminate_process(proc: subprocess.Popen) -> tuple[str, str]:
+        """Terminate a command and its process group, returning collected output."""
+        if proc.poll() is None:
+            try:
+                if os.name == "nt":
+                    proc.terminate()
+                else:
+                    os.killpg(proc.pid, signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                pass
+        try:
+            stdout, stderr = proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                if os.name == "nt":
+                    proc.kill()
+                else:
+                    os.killpg(proc.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+            stdout, stderr = proc.communicate()
+        return stdout or "", stderr or ""
+
+    def _measure(
+        self,
+        workspace: Path,
+        argv: tuple[str, ...],
+        *,
+        cancel_checker: Callable[[], bool] | None = None,
+    ) -> CommandMeasurement:
+        """Run one argv without a shell and observe cancellation while running.
+
+        ``subprocess.run(timeout=...)`` cannot reliably terminate descendants.
+        A new process group lets cancellation and timeout clean up the complete
+        command tree, which is required before a job may be marked cancelled.
+        """
         started = time.monotonic()
         try:
-            proc = subprocess.run(
-                list(argv), cwd=workspace, capture_output=True, text=True,
-                timeout=self.timeout, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            if cancel_checker and cancel_checker():
+                raise VerificationCancelled()
+            proc = subprocess.Popen(
+                list(argv), cwd=workspace, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                start_new_session=(os.name != "nt"),
             )
-            timed_out = False
-            return_code = proc.returncode
-            stdout, stderr = _redact(proc.stdout), _redact(proc.stderr)
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            return_code = 124
-            stdout = _redact(exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or ""))
-            stderr = _redact(exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or ""))
+            while True:
+                try:
+                    stdout, stderr = proc.communicate(timeout=0.1)
+                    timed_out = False
+                    return_code = proc.returncode
+                    break
+                except subprocess.TimeoutExpired:
+                    if cancel_checker and cancel_checker():
+                        out, err = self._terminate_process(proc)
+                        raise VerificationCancelled(stdout=out, stderr=err)
+                    if time.monotonic() - started >= self.timeout:
+                        out, err = self._terminate_process(proc)
+                        stdout, stderr = out, err
+                        timed_out = True
+                        return_code = 124
+                        break
+        except VerificationCancelled:
+            raise
         except OSError as exc:
             # Missing executables and permission errors are measured
             # infrastructure failures, not uncaught API exceptions.
@@ -310,6 +379,7 @@ class VerificationService:
                 tuple(argv), return_code, stdout, stderr, duration_ms, timed_out,
                 CheckOutcome.ERROR, 0, {"reason": "executable_unavailable", "error": str(exc)},
             )
+        stdout, stderr = _redact(stdout), _redact(stderr)
         duration_ms = int((time.monotonic() - started) * 1000)
         outcome, count, details = _parse_results(stdout, stderr, return_code, timed_out)
         return CommandMeasurement(tuple(argv), return_code, stdout, stderr, duration_ms, timed_out, outcome, count, details)
@@ -330,6 +400,7 @@ class VerificationService:
         repo_path: str | Path | None = None,
         command_argv: Sequence[Sequence[str]] | None = None,
         suite_id: str | None = None,
+        cancel_checker: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         source = self.store.get_verification(verification_id)
         if source is None:
@@ -351,6 +422,14 @@ class VerificationService:
         verdict = Verdict.INCONCLUSIVE
         link_payload: dict[str, Any] = {"source_verification_id": verification_id, "commands": [list(item) for item in commands]}
 
+        def append_not_run(target: str, variant: str, argv: tuple[str, ...], reason: str) -> None:
+            checks.append(CheckExecution(
+                check_id=f"check_{uuid.uuid4().hex}", verification_id=result_id,
+                suite_id=suite, target=target, variant=variant,
+                outcome=CheckOutcome.NOT_RUN, count=0, command_argv=argv,
+                details={"reason": reason},
+            ))
+
         try:
             repository = self.resolver.resolve(repo_id=repo_id, repo_path=repo_path)
             with tempfile.TemporaryDirectory(prefix="patchpilot-verify-") as temp_root:
@@ -363,10 +442,22 @@ class VerificationService:
                     raise VerificationExecutionError("candidate patch content is unavailable")
                 self._apply_patch(candidate_workspace, patch_text)
                 self._reject_symlinks(candidate_workspace)
+                cancelled = False
                 for index, argv in enumerate(commands, start=1):
                     target = f"command-{index}"
                     for variant, workspace in (("base", base_workspace), ("candidate", candidate_workspace)):
-                        measurement = self._measure(workspace, argv)
+                        if cancelled:
+                            append_not_run(target, variant, argv, "cancelled_before_check")
+                            continue
+                        try:
+                            measurement = self._measure(workspace, argv, cancel_checker=cancel_checker)
+                        except VerificationCancelled as exc:
+                            cancelled = True
+                            append_not_run(target, variant, argv, "cancelled_during_check")
+                            # The current check and every remaining variant are
+                            # represented explicitly; completed checks remain
+                            # untouched in the immutable result.
+                            continue
                         checks.append(CheckExecution(
                             check_id=f"check_{uuid.uuid4().hex}", verification_id=result_id,
                             suite_id=suite, target=target, variant=variant,
@@ -375,17 +466,31 @@ class VerificationService:
                             duration_ms=measurement.duration_ms, stdout=measurement.stdout,
                             stderr=measurement.stderr, details=measurement.details,
                         ))
+                    if cancelled:
+                        for remaining_index in range(index + 1, len(commands) + 1):
+                            remaining_target = f"command-{remaining_index}"
+                            remaining_argv = commands[remaining_index - 1]
+                            append_not_run(remaining_target, "base", remaining_argv, "cancelled_before_check")
+                            append_not_run(remaining_target, "candidate", remaining_argv, "cancelled_before_check")
+                        gaps.append("cancelled")
+                        run_state = RunState.CANCELLED
+                        break
         except (WorkspaceResolutionError, VerificationExecutionError, ValueError) as exc:
-            gaps.append(str(exc))
-            run_state = RunState.ERROR
+            if isinstance(exc, VerificationCancelled):
+                gaps.append("cancelled")
+                run_state = RunState.CANCELLED
+            else:
+                gaps.append(str(exc))
+                run_state = RunState.ERROR
             # Preserve the reason as an explicit check if the repository was
             # unavailable; there is no meaningful base/candidate execution.
-            checks.append(CheckExecution(
-                check_id=f"check_{uuid.uuid4().hex}", verification_id=result_id,
-                suite_id=suite, target="execution", variant="candidate",
-                outcome=CheckOutcome.ERROR, count=0, command_argv=tuple(commands[0]) if commands else (),
-                details={"reason": str(exc)},
-            ))
+            if not isinstance(exc, VerificationCancelled):
+                checks.append(CheckExecution(
+                    check_id=f"check_{uuid.uuid4().hex}", verification_id=result_id,
+                    suite_id=suite, target="execution", variant="candidate",
+                    outcome=CheckOutcome.ERROR, count=0, command_argv=tuple(commands[0]) if commands else (),
+                    details={"reason": str(exc)},
+                ))
 
         required_conditions = [condition for condition in contract.conditions if condition.required]
         valid_oracles = bool(required_conditions) and all(
@@ -439,5 +544,5 @@ class VerificationService:
 
 __all__ = [
     "VerificationService", "WorkspaceResolver", "WorkspaceResolutionError",
-    "VerificationExecutionError",
+    "VerificationExecutionError", "VerificationCancelled",
 ]

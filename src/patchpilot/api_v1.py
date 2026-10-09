@@ -202,7 +202,7 @@ class ConditionInput(APIModel):
 class ContractDraftCreate(APIModel):
     source_ids: list[str] = Field(min_length=1)
     base_snapshot_id: str
-    model_profile: str = "manual"
+    model_profile: Literal["manual", "remote"] = "manual"
     conditions: list[ConditionInput] = Field(default_factory=list)
 
     @field_validator("source_ids")
@@ -958,10 +958,52 @@ def draft_contract(task_id: str, body: ContractDraftCreate, request: Request):
     task = store.get_task(task_id)
     if not task:
         raise APIError(404, "task_not_found", "task does not exist or is not visible")
-    # The draft is explicitly source-first.  It never receives a candidate
-    # diff and does not pretend that a model has been called.
+    # The draft is explicitly source-first.  A remote planner, when selected,
+    # receives only the immutable task/source snapshot and is validated below;
+    # it never receives a candidate diff and never freezes acceptance criteria.
     contract_id = f"contract_{uuid.uuid4().hex}"
-    conditions = tuple(_condition_from_input(item) for item in body.conditions)
+    planned_inputs = list(body.conditions)
+    model_called = False
+    model_status = "not_requested"
+    model_error = None
+    ambiguities: list[str] = []
+    fallback = None
+    if body.model_profile == "remote":
+        model_called = True
+        try:
+            from .adapters.remote import RemoteModel
+
+            issue = task.issue_snapshot
+            planned = RemoteModel().plan_contract(
+                task_id=task.task_id,
+                issue_title=str(issue.get("title", "")),
+                issue_body=str(issue.get("body", "")),
+                source_ids=list(body.source_ids),
+                base_snapshot_id=body.base_snapshot_id,
+            )
+            raw_conditions = planned.get("conditions", [])
+            ambiguities = list(planned.get("ambiguities", []))
+            if not raw_conditions:
+                raise ValueError("remote planner returned no acceptance conditions")
+            parsed: list[ConditionInput] = []
+            source_set = set(body.source_ids)
+            for raw_condition in raw_conditions:
+                condition = ConditionInput.model_validate(raw_condition)
+                unknown_sources = sorted(set(condition.source_refs) - source_set)
+                if unknown_sources:
+                    raise ValueError("remote planner referenced an unknown source")
+                parsed.append(condition)
+            planned_inputs = parsed
+            model_status = "awaiting_input" if ambiguities else "completed"
+        except Exception as exc:
+            # A model outage/protocol error is explicit and recoverable: the
+            # maintainer can fill the draft manually, but we never synthesize
+            # a successful contract or hide the provider failure.
+            model_status = "error"
+            fallback = "manual_review"
+            planned_inputs = list(body.conditions)
+            model_error = f"{type(exc).__name__}: {str(exc)[:240]}"
+    conditions = tuple(_condition_from_input(item) for item in planned_inputs)
     contract = ContractVersion(contract_id, task_id, 1, ContractState.DRAFT, conditions, tuple(body.source_ids))
     try:
         store.save_contract_version(contract)
@@ -969,10 +1011,35 @@ def draft_contract(task_id: str, body: ContractDraftCreate, request: Request):
         raise APIError(409, "contract_conflict", str(exc)) from exc
     created = utc_now()
     resources = _resources()
-    resources.put_contract_meta(contract_id, 1, {"base_snapshot_id": body.base_snapshot_id, "model_profile": body.model_profile, "source_ids": body.source_ids, "scope_exclusions": []})
+    resources.put_contract_meta(contract_id, 1, {
+        "base_snapshot_id": body.base_snapshot_id,
+        "model_profile": body.model_profile,
+        "source_ids": body.source_ids,
+        "scope_exclusions": [],
+        "model_status": model_status,
+        "ambiguities": ambiguities,
+        **({"fallback": fallback} if fallback else {}),
+        **({"model_error": model_error} if model_error else {}),
+    })
     job_id = f"job_{uuid.uuid4().hex}"
-    resources.put_job({"job_id": job_id, "kind": "contract_draft", "state": "completed", "resource_id": contract_id, "created_at": created, "updated_at": created})
-    return _result(request, {"contract": _contract_dict(contract), "job_id": job_id, "status": "draft", "model_called": False}, 202)
+    job_state = "awaiting_input" if model_status in {"error", "awaiting_input"} else "completed"
+    resources.put_job({
+        "job_id": job_id, "kind": "contract_draft", "state": job_state,
+        "resource_id": contract_id, "created_at": created, "updated_at": created,
+        "model_profile": body.model_profile, "model_status": model_status,
+        "ambiguities": ambiguities,
+        **({"model_error": model_error} if model_error else {}),
+    })
+    response = {
+        "contract": _contract_dict(contract), "job_id": job_id, "status": "draft",
+        "model_called": model_called, "model_status": model_status,
+        "ambiguities": ambiguities,
+    }
+    if fallback:
+        response["fallback"] = fallback
+    if model_error:
+        response["model_error"] = model_error
+    return _result(request, response, 202)
 
 
 @router.put("/contracts/{contract_id}")
