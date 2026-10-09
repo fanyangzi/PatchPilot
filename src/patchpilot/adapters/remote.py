@@ -136,8 +136,12 @@ class RemoteModel:
         }
 
     def propose_patch(self, task, repo_files: dict, failed_tests: list) -> str:
-        files_ctx = '\n\n'.join(f'=== {p} ===\n{c[:2000]}' for p, c in list(repo_files.items())[:10])
-        tests_ctx = 'Failed tests:\n' + '\n'.join(f'- {t}' for t in failed_tests[:10])
+        # Keep repair prompts bounded so an OpenAI-compatible gateway can
+        # answer within the configured request timeout. The verifier still
+        # validates the returned diff against the complete workspace; this
+        # limit only controls advisory context sent over the wire.
+        files_ctx = '\n\n'.join(f'=== {p} ===\n{c[:1400]}' for p, c in list(repo_files.items())[:6])
+        tests_ctx = 'Failed tests:\n' + '\n'.join(f'- {t}' for t in failed_tests[:8])
         prompt = (
             'You are a code repair assistant. Generate a unified diff patch to fix the issue.\n\n'
             f'Issue: {task.issue_title}\n{task.issue_body[:1000]}\n\n'
