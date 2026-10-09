@@ -538,8 +538,12 @@ class EvidenceStore:
                 message = f"基线 {check.target} 的 {check.suite_id} 结果为 {outcome}；候选结论不能绕过该基线证据。"
                 represented_gaps.add("baseline_check_failed")
             else:
+                integrity_violation = bool(
+                    isinstance(check.details, Mapping)
+                    and check.details.get("integrity_violation") is True
+                )
                 kind = {
-                    "fail": "candidate_failure",
+                    "fail": "test_tampering" if integrity_violation else "candidate_failure",
                     "error": "candidate_error",
                     "flaky": "flaky",
                     "not_run": "not_run",
@@ -555,14 +559,18 @@ class EvidenceStore:
                     "unsupported": "inconclusive",
                 }.get(outcome, "inconclusive")
                 title = {
-                    "fail": "候选检查失败",
+                    "fail": "候选测试面完整性校验失败" if integrity_violation else "候选检查失败",
                     "error": "候选检查发生错误",
                     "flaky": "候选检查结果不稳定",
                     "not_run": "候选检查未运行",
                     "skipped": "候选检查被跳过",
                     "unsupported": "候选检查不受支持",
                 }.get(outcome, f"候选检查 {outcome}")
-                message = f"候选 {check.target} 的 {check.suite_id} 结果为 {outcome}；该观察尚未被提升为确定性需求违反。"
+                message = (
+                    f"候选 {check.target} 检测到测试文件或测试配置发生变化；该候选不能凭自身测试结果证明通过。"
+                    if integrity_violation else
+                    f"候选 {check.target} 的 {check.suite_id} 结果为 {outcome}；该观察尚未被提升为确定性需求违反。"
+                )
             make_finding(
                 f"check:{check.check_id}", kind=kind, status=status,
                 title=title, message=message, source_variant=check.variant,

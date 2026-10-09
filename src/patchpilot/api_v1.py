@@ -2948,7 +2948,7 @@ def create_verification(task_id: str, body: VerificationCreate, request: Request
     job_id = f"job_{uuid.uuid4().hex}"
     resources = _resources()
     workspace = _bind_acl(request, resources, "verification", verification.verification_id)
-    resources.put_job({"job_id": job_id, "kind": "verification", "state": "queued", "resource_id": verification.verification_id, "command_argv": body.command_argv, "suite_id": body.suite_id, "created_at": created, "updated_at": created})
+    resources.put_job({"job_id": job_id, "kind": "verification", "state": "queued", "resource_id": verification.verification_id, "command_argv": body.command_argv, "suite_id": body.suite_id, "baseline_tests_hash": body.baseline_tests_hash, "created_at": created, "updated_at": created})
     resources.bind_acl("job", job_id, workspace)
     return _result(request, {"verification": verification.to_dict(), "verification_key": key, "job_id": job_id, "status": "queued"}, 202)
 
@@ -3051,6 +3051,7 @@ def execute_verification(verification_id: str, body: VerificationExecute, reques
             repo_path=body.repo_path,
             command_argv=execution_commands,
             suite_id=execution_suite,
+            claimed_baseline_tests_hash=leased.get("baseline_tests_hash"),
             cancel_checker=lambda: queue.is_cancel_requested(row["job_id"], worker_id, leased["lease_token"]),
         )
     except WorkspaceResolutionError as exc:

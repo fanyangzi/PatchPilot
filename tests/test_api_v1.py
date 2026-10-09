@@ -832,3 +832,34 @@ def test_intake_source_resolution_rejects_repo_mismatch(api_client, monkeypatch)
     rejected = client.post(f"/api/v1/intakes/{intake_id}/resolve")
     assert rejected.status_code == 409
     assert rejected.json()["error"]["code"] == "source_repo_mismatch"
+
+
+def test_execution_rejects_candidate_test_surface_tampering(api_client, tmp_path, monkeypatch):
+    client, _ = api_client
+    repo, base_sha, _ = _temporary_git_repository(tmp_path)
+    # Keep production code unchanged while changing the test oracle itself.
+    subprocess.run(["git", "checkout", "--", "calc.py"], cwd=repo, check=True)
+    (repo / "test_calc.py").write_text(
+        "from calc import add\n\n"
+        "def test_add():\n"
+        "    assert add(2, 1) == 999\n",
+        encoding="utf-8",
+    )
+    tampered_patch = subprocess.check_output(["git", "diff", "--", "test_calc.py"], cwd=repo, text=True)
+    monkeypatch.setenv("PATCHPILOT_WORKSPACE_ROOTS", str(tmp_path))
+    queued, task, _, _ = _queue_verification_for_execution(client, base_sha, tampered_patch)
+
+    executed = client.post(
+        f"/api/v1/verifications/{queued['verification_id']}/execute",
+        json={"repo_path": str(repo), "command_argv": [["pytest", "-q"]], "suite_id": "pytest-default"},
+    )
+    assert executed.status_code == 201
+    payload = executed.json()
+    result = payload["verification"]
+    assert result["verdict"] == "inconclusive"
+    assert "test_surface_tampered" in result["gaps"]
+    integrity = [item for item in payload["checks"] if item["target"] == "test-surface-integrity"]
+    assert integrity and integrity[0]["outcome"] == "fail"
+    assert integrity[0]["details"]["changed_files"][0]["path"] == "test_calc.py"
+    findings = client.get(f"/api/v1/tasks/{task['task_id']}/findings").json()["items"]
+    assert any(item["kind"] == "test_tampering" for item in findings)

@@ -110,6 +110,73 @@ def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+_TEST_SURFACE_BASENAMES = frozenset({
+    "conftest.py", "pytest.ini", ".pytest.ini", "tox.ini", "setup.cfg",
+    "pyproject.toml", "package.json", "package-lock.json", "pnpm-lock.yaml",
+    "yarn.lock",
+})
+
+
+def _is_test_surface_path(relative: str) -> bool:
+    """Return whether a repository path can influence the executed tests.
+
+    This intentionally errs on the side of inclusion.  The manifest is only
+    used for an integrity comparison, so including a broad but deterministic
+    set of test/config files is safer than attempting to infer intent from a
+    patch supplied by an untrusted candidate.
+    """
+    path = Path(relative)
+    parts = {part.lower() for part in path.parts}
+    name = path.name.lower()
+    if parts & {"test", "tests", "__tests__", "spec", "specs"}:
+        return True
+    if name in _TEST_SURFACE_BASENAMES:
+        return True
+    if name.startswith(("vitest.config.", "vite.config.")):
+        return True
+    if name.startswith("test_") or name.endswith(("_test.py", ".test.js", ".test.ts", ".test.jsx", ".test.tsx", ".spec.js", ".spec.ts", ".spec.jsx", ".spec.tsx")):
+        return True
+    return False
+
+
+def _test_surface_manifest(workspace: Path) -> dict[str, str]:
+    """Hash the candidate-visible test/config surface from the workspace.
+
+    Hashes are computed from the materialized base and candidate snapshots,
+    never from a caller-provided baseline string.  Symlinks and non-files are
+    excluded because the workspace resolver rejects symlinked candidates.
+    """
+    manifest: dict[str, str] = {}
+    for path in sorted(workspace.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(workspace).as_posix()
+        if not _is_test_surface_path(relative):
+            continue
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        manifest[relative] = digest.hexdigest()
+    return manifest
+
+
+def _test_surface_diff(base: Mapping[str, str], candidate: Mapping[str, str]) -> list[dict[str, Any]]:
+    """Describe added, removed, and modified test/config files."""
+    changed: list[dict[str, Any]] = []
+    for path in sorted(set(base) | set(candidate)):
+        old, new = base.get(path), candidate.get(path)
+        if old == new:
+            continue
+        changed.append({
+            "path": path,
+            "change": "added" if old is None else "removed" if new is None else "modified",
+            "base_sha256": old,
+            "candidate_sha256": new,
+        })
+    return changed
+
+
 def _parse_results(stdout: str, stderr: str, return_code: int | None, timed_out: bool) -> tuple[CheckOutcome, int, dict[str, Any]]:
     """Parse a pytest-like command conservatively.
 
@@ -477,6 +544,7 @@ class VerificationService:
         suite_id: str | None = None,
         cancel_checker: Callable[[], bool] | None = None,
         probe_input: Any | None = None,
+        claimed_baseline_tests_hash: str | None = None,
     ) -> dict[str, Any]:
         source = self.store.get_verification(verification_id)
         if source is None:
@@ -497,6 +565,11 @@ class VerificationService:
         run_state = RunState.COMPLETED
         verdict = Verdict.INCONCLUSIVE
         link_payload: dict[str, Any] = {"source_verification_id": verification_id, "commands": [list(item) for item in commands]}
+        if claimed_baseline_tests_hash is not None:
+            # This is retained as an untrusted request annotation only.  The
+            # actual baseline hash is computed below from the materialized
+            # snapshot and is the sole integrity basis.
+            link_payload["claimed_baseline_tests_hash"] = claimed_baseline_tests_hash
         if probe_input is not None:
             link_payload["probe_input"] = probe_input
 
@@ -525,6 +598,45 @@ class VerificationService:
                     raise VerificationExecutionError("candidate patch content is unavailable")
                 self._apply_patch(candidate_workspace, patch_text)
                 self._reject_symlinks(candidate_workspace)
+                base_test_surface = _test_surface_manifest(base_workspace)
+                candidate_test_surface = _test_surface_manifest(candidate_workspace)
+                base_test_surface_hash = _sha256_bytes(
+                    json.dumps(base_test_surface, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                )
+                candidate_test_surface_hash = _sha256_bytes(
+                    json.dumps(candidate_test_surface, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                )
+                changed_test_surface = _test_surface_diff(base_test_surface, candidate_test_surface)
+                integrity_outcome = CheckOutcome.FAIL if changed_test_surface else (
+                    CheckOutcome.NOT_RUN if not base_test_surface else CheckOutcome.PASS
+                )
+                integrity_details: dict[str, Any] = {
+                    "integrity_check": "test_surface",
+                    "integrity_violation": bool(changed_test_surface),
+                    "base_test_surface_sha256": base_test_surface_hash,
+                    "candidate_test_surface_sha256": candidate_test_surface_hash,
+                    "base_test_surface_files": sorted(base_test_surface),
+                    "candidate_test_surface_files": sorted(candidate_test_surface),
+                    "changed_files": changed_test_surface,
+                    "claimed_baseline_tests_hash": claimed_baseline_tests_hash,
+                    "baseline_hash_source": "materialized_base_snapshot",
+                }
+                checks.append(CheckExecution(
+                    check_id=f"check_{uuid.uuid4().hex}", verification_id=result_id,
+                    suite_id=suite, target="test-surface-integrity", variant="candidate",
+                    outcome=integrity_outcome, count=len(changed_test_surface) if changed_test_surface else len(base_test_surface),
+                    details=integrity_details,
+                ))
+                if changed_test_surface:
+                    gaps.append("test_surface_tampered")
+                elif not base_test_surface:
+                    gaps.append("test_surface_unavailable")
+                link_payload.update({
+                    "base_test_surface_sha256": base_test_surface_hash,
+                    "candidate_test_surface_sha256": candidate_test_surface_hash,
+                    "test_surface_changed_files": changed_test_surface,
+                    "baseline_hash_source": "materialized_base_snapshot",
+                })
                 cancelled = False
                 for index, argv in enumerate(commands, start=1):
                     target = f"command-{index}"
