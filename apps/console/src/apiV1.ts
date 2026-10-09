@@ -1,5 +1,6 @@
 /** Typed access to the source-aware, versioned acceptance API. */
 const BASE = `${(import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/$/, '')}/v1`;
+const WORKSPACE = String(import.meta.env.VITE_PATCHPILOT_WORKSPACE || '').trim();
 const enc = encodeURIComponent;
 
 export class V1Error extends Error {
@@ -12,7 +13,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     response = await fetch(`${BASE}${path}`, {
       ...init,
       signal: init?.signal || AbortSignal.timeout(init?.method === 'POST' || init?.method === 'PUT' ? 30000 : 8000),
-      headers: { Accept: 'application/json', ...(init?.body ? { 'Content-Type': 'application/json' } : {}), ...(init?.headers || {}) },
+      headers: {
+        Accept: 'application/json',
+        ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(WORKSPACE ? { 'X-PatchPilot-Workspace': WORKSPACE } : {}),
+        ...(init?.headers || {}),
+      },
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error;

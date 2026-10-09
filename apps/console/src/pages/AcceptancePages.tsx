@@ -71,7 +71,17 @@ function RouteLink({ route, children }: { route: Route; children: React.ReactNod
   return <a className="ac-link" href={href(route)}>{children}<ArrowRight size={14} /></a>;
 }
 function SourceRefs({ refs }: { refs: string[] }) {
-  return refs.length ? <div className="ac-sources">{refs.map((ref) => <a key={ref} href={ref} target="_blank" rel="noreferrer"><SquareArrowOutUpRight size={12} />{ref}</a>)}</div> : <span className="ac-muted">没有已记录来源</span>;
+  if (!refs.length) return <span className="ac-muted">没有已记录来源</span>;
+  return <div className="ac-sources">{refs.map((ref) => {
+    let safeHref: string | undefined;
+    try {
+      const parsed = new URL(ref, window.location.origin);
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') safeHref = parsed.href;
+    } catch { /* Render malformed source references as inert evidence text. */ }
+    return safeHref
+      ? <a key={ref} href={safeHref} target="_blank" rel="noreferrer"><SquareArrowOutUpRight size={12} />{ref}</a>
+      : <code key={ref} className="ac-source-text">{ref}</code>;
+  })}</div>;
 }
 function taskTitle(task: Task) { return task.issue_snapshot.title || '未命名任务'; }
 function stateTone(value?: string): 'good' | 'bad' | 'warn' | 'neutral' {

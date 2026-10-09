@@ -39,7 +39,7 @@
 .ac-mini-status { display:grid; grid-template-columns:repeat(2,max-content); gap:4px 8px; font:500 var(--t-2xs)/1.4 var(--code); color:var(--ink-2); }
 .ac-next-action { font-weight:600; }
 .ac-sources { display:grid; gap:4px; max-width:260px; }
-.ac-sources a,.ac-link { display:inline-flex; align-items:center; gap:5px; color:var(--ink-2); text-decoration:none; font-size:var(--t-xs); overflow-wrap:anywhere; }
+.ac-sources a,.ac-source-text,.ac-link { display:inline-flex; align-items:center; gap:5px; color:var(--ink-2); text-decoration:none; font-size:var(--t-xs); overflow-wrap:anywhere; }
 .ac-sources a:hover,.ac-link:hover { color:var(--ink); text-decoration:underline; }
 .ac-link { color:var(--focus); font-weight:600; }
 .ac-footnote { display:flex; align-items:center; gap:8px; color:var(--ink-3); font-size:var(--t-xs); padding:2px 0; }
