@@ -40,6 +40,7 @@ from ..domain.entities import (
     aggregate_verdict,
     utc_now,
 )
+from ..verification.adapters import adapter_for_command
 
 
 class WorkspaceResolutionError(ValueError):
@@ -341,6 +342,18 @@ class VerificationService:
         command tree, which is required before a job may be marked cancelled.
         """
         started = time.monotonic()
+        adapter = adapter_for_command(argv)
+        executable = Path(argv[0]).name.lower() if argv else ""
+        # Registered test runners must be interpreted by an adapter.  Utility
+        # commands such as ``python -c`` remain executable for controlled
+        # lifecycle probes, but node/package-manager test commands with no
+        # adapter are explicit unsupported observations, never guessed passes.
+        adapter_required = executable in {"pytest", "node", "npm", "pnpm", "yarn", "vitest", "jest", "mocha"}
+        if adapter is None and adapter_required:
+            return CommandMeasurement(
+                tuple(argv), None, "", "", 0, False, CheckOutcome.UNSUPPORTED, 0,
+                {"reason": "no_registered_adapter", "command": list(argv)},
+            )
         try:
             if cancel_checker and cancel_checker():
                 raise VerificationCancelled()
@@ -381,7 +394,28 @@ class VerificationService:
             )
         stdout, stderr = _redact(stdout), _redact(stderr)
         duration_ms = int((time.monotonic() - started) * 1000)
-        outcome, count, details = _parse_results(stdout, stderr, return_code, timed_out)
+        if adapter is not None:
+            # Keep the explicit empty-collection semantics independent of an
+            # adapter's process-exit interpretation (pytest uses exit code 5
+            # for this case).  Zero collected tests remain not_run, never pass.
+            zero_collection = bool(re.search(r"\bno tests? ran\b|collected\s+0\s+items?", stdout + "\n" + stderr, re.IGNORECASE))
+            normalized = adapter.parse(stdout, stderr, return_code, timed_out=timed_out)
+            try:
+                outcome = CheckOutcome(normalized.outcome)
+            except ValueError:
+                outcome = CheckOutcome.UNSUPPORTED
+            count = int(normalized.count)
+            details = {
+                "framework": normalized.framework,
+                "adapter_supported": normalized.supported,
+                **dict(normalized.details),
+            }
+            if zero_collection:
+                outcome = CheckOutcome.NOT_RUN
+                count = 0
+                details["reason"] = "zero_test_cases"
+        else:
+            outcome, count, details = _parse_results(stdout, stderr, return_code, timed_out)
         return CommandMeasurement(tuple(argv), return_code, stdout, stderr, duration_ms, timed_out, outcome, count, details)
 
     def _save_link(self, execution_id: str, source_id: str, result_id: str, state: str, payload: Mapping[str, Any]) -> None:
