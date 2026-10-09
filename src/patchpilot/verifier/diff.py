@@ -76,9 +76,76 @@ def parse_unified_diff(diff_text: str) -> list[DiffEntry]:
                     old_path=norm_old
                 ))
 
+                # ``diff --git`` records already contain the following
+                # ``---``/``+++`` file headers.  Skip the complete record so
+                # the header-only parser below cannot report the same file a
+                # second time.  Hunk lines are not needed to identify the
+                # changed paths and a context line can legally begin with
+                # text that resembles a header.
+                next_diff = i + 1
+                while next_diff < len(lines) and not lines[next_diff].startswith('diff --git '):
+                    next_diff += 1
+                i = next_diff - 1
+
+        # Providers commonly emit a POSIX unified diff without the optional
+        # ``diff --git`` metadata line.  Git itself accepts this form, and the
+        # repair prompt explicitly asks for ``--- a/path``/``+++ b/path``.
+        # Recognise the paired file headers while requiring the conventional
+        # a/ and b/ prefixes (or /dev/null) so removed hunk content such as
+        # ``--- example`` is not mistaken for a new file record.
+        elif (
+            line.startswith('--- ')
+            and i + 1 < len(lines)
+            and lines[i + 1].startswith('+++ ')
+            and _looks_like_file_header(line[4:], 'a')
+            and _looks_like_file_header(lines[i + 1][4:], 'b')
+        ):
+            old_path = _header_path(line[4:])
+            new_path = _header_path(lines[i + 1][4:])
+            is_binary = False
+            is_mode_change = False
+            change_kind: Literal['add', 'modify', 'delete', 'rename'] = 'modify'
+            if old_path == '/dev/null':
+                change_kind = 'add'
+            elif new_path == '/dev/null':
+                change_kind = 'delete'
+
+            path = new_path if change_kind != 'delete' else old_path
+            if path == '/dev/null':
+                path = old_path if change_kind == 'delete' else new_path
+            norm_path = normalize_path(path)
+            entries.append(DiffEntry(
+                path=norm_path,
+                change_kind=change_kind,
+                is_binary=is_binary,
+                is_mode_change=is_mode_change,
+                old_path=None,
+            ))
+
         i += 1
 
     return entries
+
+
+def _header_path(value: str) -> str:
+    """Return the path portion of a unified-diff file header.
+
+    GNU diff may append a tab-separated timestamp.  Paths are intentionally
+    kept as text here; ``normalize_path`` performs the security checks used by
+    the verifier afterwards.
+    """
+    path = value.split('\t', 1)[0].strip()
+    if path == '/dev/null':
+        return path
+    if path.startswith(('a/', 'b/')):
+        return path[2:]
+    return path
+
+
+def _looks_like_file_header(value: str, prefix: str) -> bool:
+    """Check the conventional prefix used by a header-only unified diff."""
+    path = value.split('\t', 1)[0].strip()
+    return path == '/dev/null' or path.startswith(prefix + '/')
 
 def parse_name_status(output: str) -> list[DiffEntry]:
     """Parse git diff --name-status output.
