@@ -69,6 +69,8 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _MAX_PATCH_BYTES = 2 * 1024 * 1024
 _MAX_PUBLICATION_BODY_BYTES = 512 * 1024
 _PUBLICATION_PREVIEW_TTL_SECONDS = 10 * 60
+_WORKSPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}$")
+_DEFAULT_WORKSPACE = "local"
 
 
 class APIError(Exception):
@@ -473,6 +475,14 @@ class _ResourceStore:
                   body_digest TEXT NOT NULL, status TEXT NOT NULL,
                   external_id TEXT, external_url TEXT, response TEXT NOT NULL,
                   created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS api_resource_acl(
+                  resource_kind TEXT NOT NULL,
+                  resource_id TEXT NOT NULL,
+                  workspace_id TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  PRIMARY KEY(resource_kind, resource_id));
+                CREATE INDEX IF NOT EXISTS ix_api_resource_acl_workspace
+                  ON api_resource_acl(workspace_id, resource_kind, resource_id);
                 CREATE TRIGGER IF NOT EXISTS immutable_api_reports_update
                   BEFORE UPDATE ON api_reports BEGIN SELECT RAISE(ABORT, 'immutable report'); END;
                 CREATE TRIGGER IF NOT EXISTS immutable_api_reports_delete
@@ -616,6 +626,43 @@ class _ResourceStore:
         data["response"] = json.loads(data["response"])
         return data
 
+    def bind_acl(self, resource_kind: str, resource_id: str, workspace_id: str) -> None:
+        """Bind an immutable API resource to one workspace namespace."""
+        if not _WORKSPACE_RE.fullmatch(workspace_id):
+            raise ValueError("workspace_id contains unsafe characters")
+        with self.lock:
+            row = self.db.execute(
+                "SELECT workspace_id FROM api_resource_acl WHERE resource_kind=? AND resource_id=?",
+                (resource_kind, resource_id),
+            ).fetchone()
+            if row:
+                if row["workspace_id"] != workspace_id:
+                    raise ValueError("resource is already bound to another workspace")
+                return
+            self.db.execute(
+                "INSERT INTO api_resource_acl(resource_kind,resource_id,workspace_id,created_at) VALUES (?,?,?,?)",
+                (resource_kind, resource_id, workspace_id, utc_now()),
+            )
+            self.db.commit()
+
+    def acl_workspace(self, resource_kind: str, resource_id: str) -> str | None:
+        with self.lock:
+            row = self.db.execute(
+                "SELECT workspace_id FROM api_resource_acl WHERE resource_kind=? AND resource_id=?",
+                (resource_kind, resource_id),
+            ).fetchone()
+        return str(row["workspace_id"]) if row else None
+
+    def list_acl_resources(self, workspace_id: str, resource_kind: str | None = None) -> list[str]:
+        query = "SELECT resource_id FROM api_resource_acl WHERE workspace_id=?"
+        params: list[str] = [workspace_id]
+        if resource_kind:
+            query += " AND resource_kind=?"
+            params.append(resource_kind)
+        query += " ORDER BY resource_id"
+        with self.lock:
+            return [str(row["resource_id"]) for row in self.db.execute(query, params).fetchall()]
+
 
 def _evidence_store():
     # Delayed import prevents the existing app module's store construction from
@@ -626,6 +673,65 @@ def _evidence_store():
 
 def _resources() -> _ResourceStore:
     return _ResourceStore(_evidence_store())
+
+
+def _acl_enabled() -> bool:
+    return os.getenv("PATCHPILOT_ACL_REQUIRED", "0") == "1"
+
+
+def _workspace_for_request(request: Request) -> str:
+    workspace = request.headers.get("X-PatchPilot-Workspace") or os.getenv("PATCHPILOT_WORKSPACE_ID") or _DEFAULT_WORKSPACE
+    if not _WORKSPACE_RE.fullmatch(workspace):
+        raise APIError(422, "invalid_workspace", "X-PatchPilot-Workspace has an invalid format")
+    if _acl_enabled() and not request.headers.get("X-PatchPilot-Workspace") and not os.getenv("PATCHPILOT_WORKSPACE_ID"):
+        raise APIError(401, "workspace_required", "X-PatchPilot-Workspace is required")
+    return workspace
+
+
+def _acl_resource_from_path(path: str) -> tuple[str, str] | None:
+    """Extract an explicit resource id for middleware-level ACL checks."""
+    parts = [part for part in path.split("/") if part]
+    if len(parts) < 4 or parts[:2] != ["api", "v1"]:
+        return None
+    mapping = {
+        "tasks": "task", "intakes": "intake", "jobs": "job", "candidates": "candidate",
+        "contracts": "contract", "verifications": "verification", "findings": "finding",
+        "reports": "report", "publications": "publication",
+    }
+    kind = mapping.get(parts[2])
+    if kind:
+        return kind, parts[3]
+    return None
+
+
+def _acl_allows(request: Request, resource_kind: str, resource_id: str) -> bool:
+    workspace = _workspace_for_request(request)
+    owner = _resources().acl_workspace(resource_kind, resource_id)
+    # Existing databases predate ACL metadata.  They remain visible in the
+    # compatibility mode, while an explicitly enabled ACL deployment fails
+    # closed instead of guessing an owner for historical records.
+    if owner is None:
+        return not _acl_enabled()
+    return hmac.compare_digest(owner, workspace)
+
+
+def _acl_denial(request: Request, code: str = "resource_not_visible") -> JSONResponse:
+    status = 401 if code == "workspace_required" else 404
+    return JSONResponse(
+        {"error": {"code": code, "message": "resource does not exist or is not visible"}, "request_id": _rid(request)},
+        status_code=status,
+        headers={"X-Request-ID": _rid(request)},
+    )
+
+
+def _bind_acl(request: Request, resources: _ResourceStore, resource_kind: str, resource_id: str) -> str:
+    """Bind one newly-created resource and return its workspace namespace."""
+    workspace = _workspace_for_request(request)
+    try:
+        resources.bind_acl(resource_kind, resource_id, workspace)
+    except ValueError as exc:
+        raise APIError(409, "acl_binding_conflict", str(exc)) from exc
+    return workspace
 
 
 def _github_source_resolver() -> GitHubSourceResolver:
@@ -725,6 +831,10 @@ def v1_list_tasks(request: Request, limit: int = 100, cursor: str | None = None)
             (limit + 1,),
         ).fetchall()
     items = [_task_dict(Task(**json.loads(row["payload"]))) for row in rows[:limit]]
+    if _acl_enabled():
+        workspace = _workspace_for_request(request)
+        visible = set(_resources().list_acl_resources(workspace, "task"))
+        items = [item for item in items if item["task_id"] in visible]
     next_cursor = items[-1]["task_id"] if len(rows) > limit and items else None
     return _result(request, {"items": items, "next_cursor": next_cursor, "total": len(items)})
 
@@ -743,6 +853,10 @@ def v1_inbox(request: Request, limit: int = 100, cursor: str | None = None):
             "ORDER BY tv.created_at DESC, tv.task_id DESC"
         ).fetchall()
     tasks = [Task(**json.loads(row["payload"])) for row in rows]
+    if _acl_enabled():
+        workspace = _workspace_for_request(request)
+        visible = set(_resources().list_acl_resources(workspace, "task"))
+        tasks = [task for task in tasks if task.task_id in visible]
     if cursor:
         # Cursors are the last seen task ID and are applied after stable ordering.
         found = next((i for i, task in enumerate(tasks) if task.task_id == cursor), None)
@@ -808,8 +922,10 @@ def create_intake(body: IntakeCreate, request: Request):
     })
     resources = _resources()
     resources.put_intake(payload)
+    workspace = _bind_acl(request, resources, "intake", intake_id)
     job_id = f"job_{uuid.uuid4().hex}"
     resources.put_job({"job_id": job_id, "kind": "intake", "state": "queued", "resource_id": intake_id, "created_at": created, "updated_at": created})
+    resources.bind_acl("job", job_id, workspace)
     _bind_idempotency(scope, idem_key, intake_id)
     return _result(request, {"intake_id": intake_id, "status": payload["status"], "job_id": job_id, "intake": payload}, 202)
 
@@ -983,6 +1099,10 @@ def create_task(body: TaskCreate, request: Request):
     intake = resources.get_intake(body.intake_id)
     if not intake:
         raise APIError(404, "intake_not_found", "intake does not exist or is not visible")
+    workspace = _workspace_for_request(request)
+    intake_workspace = resources.acl_workspace("intake", body.intake_id)
+    if intake_workspace and not hmac.compare_digest(intake_workspace, workspace):
+        raise APIError(404, "intake_not_found", "intake does not exist or is not visible")
     task_id = f"task_{uuid.uuid4().hex}"
     source_refs = tuple(intake.get("source_refs") or [])
     for key in ("pr_url", "issue_url"):
@@ -1003,6 +1123,7 @@ def create_task(body: TaskCreate, request: Request):
         _evidence_store().save_task(task)
     except ValueError as exc:
         raise APIError(409, "task_conflict", str(exc)) from exc
+    _bind_acl(request, resources, "task", task_id)
     _bind_idempotency(scope, idem_key, task_id)
     return _result(request, {"task": _task_dict(task), "status": "draft"}, 201)
 
@@ -1091,6 +1212,7 @@ def draft_contract(task_id: str, body: ContractDraftCreate, request: Request):
         **({"fallback": fallback} if fallback else {}),
         **({"model_error": model_error} if model_error else {}),
     })
+    workspace = _bind_acl(request, resources, "contract", contract_id)
     job_id = f"job_{uuid.uuid4().hex}"
     job_state = "awaiting_input" if model_status in {"error", "awaiting_input"} else "completed"
     resources.put_job({
@@ -1100,6 +1222,7 @@ def draft_contract(task_id: str, body: ContractDraftCreate, request: Request):
         "ambiguities": ambiguities,
         **({"model_error": model_error} if model_error else {}),
     })
+    resources.bind_acl("job", job_id, workspace)
     response = {
         "contract": _contract_dict(contract), "job_id": job_id, "status": "draft",
         "model_called": model_called, "model_status": model_status,
@@ -1241,12 +1364,15 @@ def reproduce_finding(finding_id: str, body: FindingReproduceCreate, request: Re
 
     created = utc_now()
     job_id = f"job_{uuid.uuid4().hex}"
-    queue = _resources().jobs
+    resources = _resources()
+    workspace = resources.acl_workspace("finding", finding_id) or _workspace_for_request(request)
+    queue = resources.jobs
     queue.create({
         "job_id": job_id, "kind": "finding_reproduce", "state": "queued",
         "resource_id": finding.verification_id, "created_at": created, "updated_at": created,
         "finding_id": finding_id, "repeats": body.repeats,
     })
+    resources.bind_acl("job", job_id, workspace)
     worker_id = f"api-reproduce:{uuid.uuid4().hex}"
     leased = queue.claim(worker_id, job_id=job_id, lease_seconds=900)
     if not leased:
@@ -1304,6 +1430,9 @@ def reproduce_finding(finding_id: str, body: FindingReproduceCreate, request: Re
         )
         store.save_check_execution(summary_check)
         findings = store.derive_findings_for_verification(summary_id)
+        resources.bind_acl("verification", summary_id, workspace)
+        for item in findings:
+            resources.bind_acl("finding", item.finding_id, workspace)
         final_result = {
             "execution_id": f"reproduction_{uuid.uuid4().hex}",
             "source_verification_id": finding.verification_id,
@@ -1311,6 +1440,16 @@ def reproduce_finding(finding_id: str, body: FindingReproduceCreate, request: Re
             "checks": [summary_check.to_dict()],
             "findings": [item.to_dict() for item in findings],
         }
+
+    # Each repetition is a new immutable verification snapshot.  Keep all
+    # snapshots and derived findings in the same workspace as the source.
+    for repetition in repetitions:
+        repetition_id = repetition.get("verification", {}).get("verification_id")
+        if repetition_id:
+            resources.bind_acl("verification", str(repetition_id), workspace)
+        for item in repetition.get("findings", []):
+            if item.get("finding_id"):
+                resources.bind_acl("finding", str(item["finding_id"]), workspace)
 
     completed = queue.complete(job_id, worker_id, leased["lease_token"], state="completed", payload={
         "result_verification_id": final_result["verification"]["verification_id"],
@@ -1414,7 +1553,9 @@ def create_report(verification_id: str, body: dict[str, Any], request: Request):
         "snapshot": snapshot,
         "created_at": utc_now(),
     }
-    _resources().save_report(record)
+    resources = _resources()
+    resources.save_report(record)
+    _bind_acl(request, resources, "report", report_id)
     return _result(request, {"report": {key: record[key] for key in ("report_id", "task_id", "verification_id", "verification_key", "format", "content_type", "content_sha", "created_at")}}, 201)
 
 
@@ -1543,7 +1684,10 @@ def create_publication_preview(report_id: str, body: PublishPreviewCreate, reque
         "status": "previewed",
         "target_snapshot": target,
     }
-    _resources().save_publication_preview(preview)
+    resources = _resources()
+    resources.save_publication_preview(preview)
+    workspace = resources.acl_workspace("report", report_id) or _workspace_for_request(request)
+    resources.bind_acl("preview", preview_id, workspace)
     return _result(request, {
         "preview": {
             "preview_id": preview_id,
@@ -1616,7 +1760,10 @@ def publish_report(report_id: str, body: PublishCreate, request: Request):
         "created_at": created_at,
     }
     try:
-        _resources().save_publication(publication)
+        resources = _resources()
+        resources.save_publication(publication)
+        workspace = resources.acl_workspace("report", report_id) or _workspace_for_request(request)
+        resources.bind_acl("publication", publication["publication_id"], workspace)
     except Exception as exc:
         # A successful remote write with a local persistence failure must not
         # be retried automatically: callers need an operator-visible error to
@@ -1664,7 +1811,9 @@ def create_candidate(task_id: str, body: CandidateCreate, request: Request):
         store.save_candidate(candidate)
     except ValueError as exc:
         raise APIError(409, "candidate_conflict", str(exc)) from exc
-    _resources().put_candidate_content(candidate_id, body.patch_text, body.content_ref, patch_hash)
+    resources = _resources()
+    _bind_acl(request, resources, "candidate", candidate_id)
+    resources.put_candidate_content(candidate_id, body.patch_text, body.content_ref, patch_hash)
     return _result(request, {"candidate": candidate.to_dict(), "content_status": "stored"}, 201)
 
 
@@ -1766,7 +1915,11 @@ def create_repair(task_id: str, body: RepairCreate, request: Request):
             tree_digest, patch_hash, "remote_model", parent.candidate_id,
         )
         store.save_candidate(child)
-        _resources().put_candidate_content(child.candidate_id, patch_text, None, patch_hash)
+        resources = _resources()
+        resources.put_candidate_content(child.candidate_id, patch_text, None, patch_hash)
+        workspace = resources.acl_workspace("task", task_id) or _workspace_for_request(request)
+        resources.bind_acl("candidate", child.candidate_id, workspace)
+        resources.bind_acl("job", job_id, workspace)
         completed = queue.complete(job_id, worker_id, leased["lease_token"], state="completed", payload={
             "candidate_id": child.candidate_id, "changed_paths": changed_paths,
             "budget_used": 1, "approved_budget": body.max_budget,
@@ -1834,7 +1987,10 @@ def create_verification(task_id: str, body: VerificationCreate, request: Request
         raise APIError(409, "verification_conflict", str(exc)) from exc
     created = utc_now()
     job_id = f"job_{uuid.uuid4().hex}"
-    _resources().put_job({"job_id": job_id, "kind": "verification", "state": "queued", "resource_id": verification.verification_id, "command_argv": body.command_argv, "suite_id": body.suite_id, "created_at": created, "updated_at": created})
+    resources = _resources()
+    workspace = _bind_acl(request, resources, "verification", verification.verification_id)
+    resources.put_job({"job_id": job_id, "kind": "verification", "state": "queued", "resource_id": verification.verification_id, "command_argv": body.command_argv, "suite_id": body.suite_id, "created_at": created, "updated_at": created})
+    resources.bind_acl("job", job_id, workspace)
     return _result(request, {"verification": verification.to_dict(), "verification_key": key, "job_id": job_id, "status": "queued"}, 202)
 
 
@@ -1970,6 +2126,15 @@ def execute_verification(verification_id: str, body: VerificationExecute, reques
         "execution_id": result.get("execution_id"),
         "execution_status": execution_status,
     })
+    resources = _resources()
+    workspace = resources.acl_workspace("verification", verification_id) or _workspace_for_request(request)
+    result_verification_id = result.get("verification", {}).get("verification_id")
+    if result_verification_id:
+        resources.bind_acl("verification", str(result_verification_id), workspace)
+    for finding in result.get("findings", []):
+        finding_id = finding.get("finding_id") if isinstance(finding, dict) else None
+        if finding_id:
+            resources.bind_acl("finding", str(finding_id), workspace)
     return _result(request, {**result, "status": execution_status}, 201)
 
 
@@ -2000,6 +2165,27 @@ def install_api_v1(app: FastAPI) -> None:
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
         return response
+
+    @app.middleware("http")
+    async def _acl_middleware(request: Request, call_next):
+        # ACL is opt-in for backwards-compatible local development.  Once
+        # enabled, explicit resource routes fail closed before a handler can
+        # reveal a cross-workspace row or perform a side effect.
+        if request.url.path.startswith("/api/v1"):
+            try:
+                if _acl_enabled() and request.url.path != "/api/v1/health":
+                    # A workspace namespace is required for collection routes
+                    # as well as explicit IDs; otherwise list endpoints could
+                    # reveal rows even when detail routes are protected.
+                    _workspace_for_request(request)
+                resource = _acl_resource_from_path(request.url.path)
+                if resource and not _acl_allows(request, *resource):
+                    return _acl_denial(request)
+            except APIError as exc:
+                if exc.code == "workspace_required":
+                    return _acl_denial(request, "workspace_required")
+                return _error_payload(request, exc)
+        return await call_next(request)
 
     @app.exception_handler(APIError)
     async def _api_error_handler(request: Request, exc: APIError):
