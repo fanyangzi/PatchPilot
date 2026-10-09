@@ -113,6 +113,26 @@ def test_task_graph_exposes_provenance_and_supports_focus(api_client):
     assert client.get(f"/api/v1/tasks/{task['task_id']}/graph", params={"focus": "missing-node"}).status_code == 404
 
 
+def test_task_listing_cursor_advances_and_rejects_unknown_cursor(api_client):
+    client, _ = api_client
+    first = _create_task(client)
+    second = _create_task(client)
+
+    page = client.get("/api/v1/tasks?limit=1")
+    assert page.status_code == 200
+    body = page.json()
+    assert len(body["items"]) == 1
+    assert body["next_cursor"] == body["items"][0]["task_id"]
+
+    next_page = client.get(f"/api/v1/tasks?limit=1&cursor={body['next_cursor']}")
+    assert next_page.status_code == 200
+    assert [item["task_id"] for item in next_page.json()["items"]] == [first["task_id"]]
+    assert next_page.json()["next_cursor"] is None
+    invalid = client.get("/api/v1/tasks?cursor=task-does-not-exist")
+    assert invalid.status_code == 400
+    assert invalid.json()["error"]["code"] == "invalid_cursor"
+
+
 def test_probe_plan_is_bounded_and_does_not_claim_evidence(api_client):
     client, _ = api_client
     task = _create_task(client)

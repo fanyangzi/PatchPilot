@@ -1091,9 +1091,10 @@ def _task_graph(store, task: Task) -> tuple[list[dict[str, Any]], list[dict[str,
     candidates = store.list_candidates(task.task_id)
     contracts = store.list_contract_versions(task.task_id)
     verifications = [verification for candidate in candidates for verification in store.list_verifications(candidate.candidate_id)]
-    # Derivation is idempotent and only creates findings for measured rows; a
-    # queued verification with no checks remains graphically incomplete.
-    findings = store.ensure_findings_for_task(task.task_id)
+    # The graph is a read-only projection.  Findings are included only after
+    # their immutable rows have been persisted by the verifier/findings API;
+    # reading a graph must not materialize or rewrite evidence.
+    findings = store.list_findings(task.task_id)
 
     for candidate in candidates:
         candidate_id = f"candidate:{candidate.candidate_id}"
@@ -1300,15 +1301,22 @@ def v1_list_tasks(request: Request, limit: int = 100, cursor: str | None = None)
     store = _evidence_store()
     with store._lock:
         rows = store.db.execute(
-            "SELECT payload FROM task_versions WHERE revision IN (SELECT MAX(revision) FROM task_versions GROUP BY task_id) ORDER BY created_at DESC LIMIT ?",
-            (limit + 1,),
+            "SELECT payload FROM task_versions WHERE revision IN (SELECT MAX(revision) FROM task_versions GROUP BY task_id) ORDER BY created_at DESC, task_id DESC",
         ).fetchall()
-    items = [_task_dict(Task(**json.loads(row["payload"]))) for row in rows[:limit]]
+    tasks = [Task(**json.loads(row["payload"])) for row in rows]
     if _acl_enabled():
         workspace = _workspace_for_request(request)
         visible = set(_resources().list_acl_resources(workspace, "task"))
-        items = [item for item in items if item["task_id"] in visible]
-    next_cursor = items[-1]["task_id"] if len(rows) > limit and items else None
+        tasks = [task for task in tasks if task.task_id in visible]
+    if cursor:
+        found = next((index for index, task in enumerate(tasks) if task.task_id == cursor), None)
+        if found is None:
+            raise APIError(400, "invalid_cursor", "cursor does not identify a current task")
+        tasks = tasks[found + 1:]
+    has_more = len(tasks) > limit
+    selected = tasks[:limit]
+    items = [_task_dict(task) for task in selected]
+    next_cursor = selected[-1].task_id if has_more and selected else None
     return _result(request, {"items": items, "next_cursor": next_cursor, "total": len(items)})
 
 
@@ -1361,13 +1369,17 @@ def v1_inbox(request: Request, limit: int = 100, cursor: str | None = None):
             action, reason = "view_report", "Review the recorded decision and evidence"
         items.append({
             "task_id": task.task_id,
+            "task": _task_dict(task),
             "title": task.issue_snapshot.get("title", "Untitled task"),
             "repo": task.issue_snapshot.get("repo_id"),
             "mode": task.mode,
             "created_at": task.created_at,
             "source_refs": list(task.source_refs),
             "candidate_count": len(candidates),
+            "candidate": candidates[-1].to_dict() if candidates else None,
             "current_contract": ({"contract_id": latest_contract.contract_id, "revision": latest_contract.revision, "state": latest_contract.state.value} if latest_contract else None),
+            "contract": _contract_dict(latest_contract) if latest_contract else None,
+            "verification": _verification_dict(store, latest_verification) if latest_verification else None,
             "latest_verification": _verification_dict(store, latest_verification) if latest_verification else None,
             "next_action": action,
             "next_action_reason": reason,
