@@ -689,13 +689,58 @@ class EvidenceStore:
         return event_data.get('event_hash')
 
     def add_evidence(self,run_id:str,evidence:Evidence):
+        """Append one immutable evidence record with validated parent links.
+
+        Evidence is a provenance graph, not a mutable cache.  Earlier code used
+        ``INSERT OR REPLACE`` which allowed a caller to silently rewrite an
+        existing node (and even point it at a different run).  Parents must
+        already exist in the same run; this makes the graph append-only and
+        prevents cross-run references from leaking provenance.
+        """
+        if not isinstance(evidence, Evidence):
+            raise TypeError("evidence must be an Evidence record")
+        parents = list(evidence.parents or [])
+        if evidence.evidence_id in parents:
+            raise ValueError("evidence cannot be its own parent")
+        if len(set(parents)) != len(parents):
+            raise ValueError("evidence parents must be unique")
+        payload = json.dumps(evidence.to_dict(), ensure_ascii=False)
         with self._lock:
-            self.db.execute("INSERT OR REPLACE INTO evidence VALUES (?,?,?)",(evidence.evidence_id,run_id,json.dumps(evidence.to_dict(),ensure_ascii=False)))
+            existing = self.db.execute(
+                "SELECT run_id,payload FROM evidence WHERE evidence_id=?",
+                (evidence.evidence_id,),
+            ).fetchone()
+            if existing:
+                # Idempotent replays are accepted only when the immutable
+                # record is byte-for-byte equivalent and remains in the same
+                # run.  Any attempted mutation fails closed.
+                if str(existing["run_id"]) != str(run_id) or json.loads(existing["payload"]) != evidence.to_dict():
+                    raise ValueError("evidence record is immutable")
+                return
+            if parents:
+                placeholders = ",".join("?" for _ in parents)
+                rows = self.db.execute(
+                    f"SELECT evidence_id FROM evidence WHERE run_id=? AND evidence_id IN ({placeholders})",
+                    [run_id, *parents],
+                ).fetchall()
+                found = {str(row["evidence_id"]) for row in rows}
+                missing = [parent for parent in parents if parent not in found]
+                if missing:
+                    raise ValueError(f"evidence parent does not exist in run: {missing[0]}")
+            self.db.execute("INSERT INTO evidence VALUES (?,?,?)", (evidence.evidence_id, run_id, payload))
             self.db.commit()
 
     def add_artifact(self,artifact:Artifact):
         with self._lock:
-            self.db.execute("INSERT OR REPLACE INTO artifacts VALUES (?,?,?)",(artifact.artifact_id,artifact.run_id,json.dumps(artifact.to_dict(),ensure_ascii=False)))
+            payload = json.dumps(artifact.to_dict(), ensure_ascii=False)
+            existing = self.db.execute(
+                "SELECT run_id,payload FROM artifacts WHERE artifact_id=?", (artifact.artifact_id,)
+            ).fetchone()
+            if existing:
+                if str(existing["run_id"]) != str(artifact.run_id) or json.loads(existing["payload"]) != artifact.to_dict():
+                    raise ValueError("artifact record is immutable")
+                return
+            self.db.execute("INSERT INTO artifacts VALUES (?,?,?)",(artifact.artifact_id,artifact.run_id,payload))
             self.db.commit()
 
     def get_run(self,run_id):
@@ -722,6 +767,14 @@ class EvidenceStore:
         with self._lock:
             rows=self.db.execute("SELECT payload FROM artifacts WHERE run_id=?",(run_id,)).fetchall()
             return [json.loads(row["payload"]) for row in rows]
+
+    def get_artifact(self, artifact_id: str) -> dict[str, Any] | None:
+        """Return one registered artifact by its immutable link id."""
+        with self._lock:
+            row = self.db.execute(
+                "SELECT payload FROM artifacts WHERE artifact_id=?", (artifact_id,)
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
 
     def check_artifacts(self, run_id: str) -> dict[str, Any]:
         """Verify every recorded artifact for one run without mutating state.

@@ -57,6 +57,7 @@ export type Check = {
   stdout: string; stderr: string; artifact_refs: string[]; details: Record<string, unknown>; created_at: string;
 };
 export type Finding = { finding_id?: string; kind?: string; status?: string; title?: string; message?: string; evidence_refs?: string[]; created_at?: string; [key: string]: unknown };
+export type ProbeCase = { value: unknown; label: string; input_hash: string };
 export type ReportMeta = { report_id: string; task_id: string; verification_id: string; verification_key: string; format: 'markdown' | 'html'; content_type: string; content_sha: string; created_at: string };
 export type Report = ReportMeta & { snapshot: { task: Task; candidate: Candidate; contract: Contract; verification: Verification; scope_statement?: string; generated_at?: string } };
 
@@ -73,6 +74,7 @@ export const v1 = {
   checks: (id: string) => request<{ items: Check[]; complete: boolean; required_gaps: string[] }>(`/verifications/${enc(id)}/checks`),
   executeVerification: (id: string, body: { repo_id?: string; repo_path?: string; suite_id?: string; command_argv?: string[][] }) => request<{ execution_id: string; source_verification_id: string; verification: Verification; checks: Check[]; status: string }>(`/verifications/${enc(id)}/execute`, { method: 'POST', body: json(body) }),
   findings: (taskId: string, candidateId?: string) => request<{ items: Finding[]; available: boolean; complete: boolean; reason?: string }>(`/tasks/${enc(taskId)}/findings${candidateId ? `?candidate_id=${enc(candidateId)}` : ''}`),
+  probePlan: (taskId: string, seed: unknown, maxCases = 12, oracleId?: string) => request<{ task_id: string; status: string; bounded: boolean; max_cases: number; cases: ProbeCase[]; disclosure: string }>(`/tasks/${enc(taskId)}/probe-plan`, { method: 'POST', body: json({ seed, max_cases: maxCases, oracle_id: oracleId }) }),
   reports: (taskId: string) => request<{ items: ReportMeta[] }>(`/tasks/${enc(taskId)}/reports`),
   report: (id: string) => request<{ report: Report }>(`/reports/${enc(id)}`),
   reportContent: (id: string) => request<{ report_id: string; format: string; content: string; content_sha: string }>(`/reports/${enc(id)}/content`),

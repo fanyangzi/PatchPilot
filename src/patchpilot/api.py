@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os, platform, re, time, uuid
+import hashlib, json, os, platform, re, time, uuid
 from pathlib import Path
 import errno
 
@@ -13,6 +13,7 @@ from .api_v1 import install_api_v1, router as api_v1_router
 try:
     from fastapi import FastAPI, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import Response
 except ImportError as exc:  # optional API dependency, keeps CLI usable
     raise RuntimeError("FastAPI is required for the API. Install with: python -m pip install -e '.[api]'") from exc
 
@@ -241,10 +242,18 @@ def get_artifact_content(run_id: str, artifact_id: str):
         path = recorded_path.resolve(strict=True)
     except FileNotFoundError:
         raise HTTPException(404, "artifact not readable")
-    if recorded_path.is_symlink() or any(part.is_symlink() for part in recorded_path.parents if part.exists()):
-        raise HTTPException(404, "artifact not readable")
     if not path.is_relative_to(root) or not path.is_file():
         raise HTTPException(404,"artifact not readable")
+    # Ignore system-level aliases (for example macOS /var -> /private/var),
+    # but reject symlinks that can redirect a path inside the artifact root.
+    if recorded_path.is_symlink():
+        raise HTTPException(404, "artifact not readable")
+    relative = path.relative_to(root)
+    cursor = root
+    for component in relative.parts[:-1]:
+        cursor = cursor / component
+        if cursor.is_symlink():
+            raise HTTPException(404, "artifact not readable")
     try:
         # O_NOFOLLOW closes the common final-component symlink race on POSIX.
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -259,6 +268,65 @@ def get_artifact_content(run_id: str, artifact_id: str):
             raise
         raise HTTPException(404, "artifact not readable") from exc
     return {"artifact_id": artifact_id, "name": path.name, "kind": record.get("kind"), "truncated": stat.st_size > ARTIFACT_PREVIEW_BYTES, "content": _safe_text(raw.decode("utf-8", errors="replace"))}
+
+
+@app.get("/api/runs/{run_id}/artifacts/{artifact_id}/download")
+def download_artifact(run_id: str, artifact_id: str):
+    """Download a registered artifact only after digest/path verification."""
+    if not store.get_run(run_id):
+        raise HTTPException(404, "run not found")
+    record = next((a for a in store.list_artifacts(run_id) if a.get("artifact_id") == artifact_id), None)
+    if not record:
+        raise HTTPException(404, "artifact not found")
+    root = ARTIFACT_ROOT.resolve()
+    recorded_path = Path(str(record.get("path") or ""))
+    try:
+        path = recorded_path.resolve(strict=True)
+        if not path.is_relative_to(root) or not path.is_file():
+            raise HTTPException(404, "artifact not readable")
+        if recorded_path.is_symlink():
+            raise HTTPException(404, "artifact not readable")
+        relative = path.relative_to(root)
+        cursor = root
+        for component in relative.parts[:-1]:
+            cursor = cursor / component
+            if cursor.is_symlink():
+                raise HTTPException(404, "artifact not readable")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            initial_stat = os.fstat(fd)
+            if initial_stat.st_size > 100 * 1024 * 1024:
+                raise HTTPException(413, "artifact too large")
+            chunks = []
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+            stat = os.fstat(fd)
+        finally:
+            os.close(fd)
+    except HTTPException:
+        raise
+    except (FileNotFoundError, NotADirectoryError, PermissionError, OSError) as exc:
+        raise HTTPException(404, "artifact not readable") from exc
+    if stat.st_size != int(record.get("size", -1)) or hashlib.sha256(raw).hexdigest() != str(record.get("sha256") or ""):
+        raise HTTPException(409, "artifact integrity check failed")
+    filename = path.name
+    return Response(content=raw, media_type="application/octet-stream", headers={
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "X-Artifact-SHA256": str(record.get("sha256") or ""),
+    })
+
+
+@app.get("/api/runs/{run_id}/bundle-check")
+def check_run_bundle(run_id: str):
+    """Legacy-compatible API projection of the CLI bundle integrity check."""
+    if not store.get_run(run_id):
+        raise HTTPException(404, "run not found")
+    return store.check_artifacts(run_id)
 
 @app.get("/api/tasks")
 def list_tasks():

@@ -85,6 +85,20 @@ def test_v1_only_lists_durable_tasks_and_creates_real_local_patch_candidate(api_
     assert client.get(f"/api/v1/candidates/{candidate['candidate_id']}/diff").json()["content"] == patch
 
 
+def test_probe_plan_is_bounded_and_does_not_claim_evidence(api_client):
+    client, _ = api_client
+    task = _create_task(client)
+    response = client.post(f"/api/v1/tasks/{task['task_id']}/probe-plan", json={
+        "seed": {"amount": 1, "currency": "CNY"}, "max_cases": 4, "oracle_id": "AC-01",
+    })
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "planned"
+    assert body["bounded"] is True
+    assert len(body["cases"]) <= 4
+    assert "not evidence" in body["disclosure"]
+
+
 def test_contract_versions_freeze_immutably_and_verification_is_not_assumed_pass(api_client):
     client, api = api_client
     task = _create_task(client)

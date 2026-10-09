@@ -21,6 +21,7 @@ import json
 import os
 import platform
 import re
+import stat as statlib
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -31,7 +32,7 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 from .domain.entities import (
@@ -61,6 +62,7 @@ from .application.job_worker import DurableJobStore
 from .domain.entities import CheckExecution
 from .verifier.diff import parse_unified_diff
 from .integrations.github_source import GitHubSourceResolver, SourceResolutionError
+from .verification.probes import generate_boundary_inputs
 
 
 router = APIRouter(prefix="/api/v1", tags=["v1"])
@@ -71,6 +73,8 @@ _MAX_PUBLICATION_BODY_BYTES = 512 * 1024
 _PUBLICATION_PREVIEW_TTL_SECONDS = 10 * 60
 _WORKSPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}$")
 _DEFAULT_WORKSPACE = "local"
+_MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+_WEBHOOK_MAX_BODY_BYTES = 2 * 1024 * 1024
 
 
 class APIError(Exception):
@@ -317,6 +321,19 @@ class FindingReproduceCreate(APIModel):
         return value
 
 
+class ProbePlanCreate(APIModel):
+    """Request a bounded, deterministic counterexample probe plan."""
+
+    seed: Any = None
+    max_cases: int = Field(default=12, ge=1, le=64)
+    oracle_id: str | None = None
+
+    @field_validator("oracle_id")
+    @classmethod
+    def validate_oracle_id(cls, value: str | None) -> str | None:
+        return _valid_id(value, "oracle_id") if value is not None else None
+
+
 class RepairCreate(APIModel):
     """Explicitly approved, bounded candidate repair request.
 
@@ -475,6 +492,24 @@ class _ResourceStore:
                   body_digest TEXT NOT NULL, status TEXT NOT NULL,
                   external_id TEXT, external_url TEXT, response TEXT NOT NULL,
                   created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS api_webhook_deliveries(
+                  delivery_id TEXT PRIMARY KEY,
+                  event_name TEXT NOT NULL,
+                  payload_sha TEXT NOT NULL,
+                  workspace_id TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  job_id TEXT,
+                  created_at TEXT NOT NULL,
+                  response TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_api_webhook_deliveries_event
+                  ON api_webhook_deliveries(event_name, created_at);
+                CREATE TABLE IF NOT EXISTS api_report_staleness(
+                  report_id TEXT PRIMARY KEY,
+                  current_head TEXT NOT NULL,
+                  reason TEXT NOT NULL,
+                  observed_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS api_resource_acl(
                   resource_kind TEXT NOT NULL,
                   resource_id TEXT NOT NULL,
@@ -572,6 +607,29 @@ class _ResourceStore:
             values.append(data)
         return values
 
+    def list_reports_for_repo_pr(self, repo_id: str, pr_number: int) -> list[dict[str, Any]]:
+        """Find report snapshots associated with a GitHub repository/PR.
+
+        Older snapshots may not carry a PR number; those are intentionally
+        ignored rather than guessed stale.  New intake snapshots can include
+        ``pr_number`` (or ``number``) in their issue snapshot.
+        """
+        with self.lock:
+            rows = self.db.execute("SELECT * FROM api_reports ORDER BY created_at,report_id").fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            data = dict(row)
+            try:
+                data["snapshot"] = json.loads(data["snapshot"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            issue = ((data.get("snapshot") or {}).get("task") or {}).get("issue_snapshot") or {}
+            issue_repo = issue.get("repo_id") or issue.get("repository")
+            issue_number = issue.get("pr_number") or issue.get("number")
+            if str(issue_repo).lower() == str(repo_id).lower() and str(issue_number) == str(pr_number):
+                result.append(data)
+        return result
+
     def save_publication_preview(self, payload: dict[str, Any]) -> None:
         with self.lock:
             self.db.execute(
@@ -625,6 +683,63 @@ class _ResourceStore:
         data = dict(row)
         data["response"] = json.loads(data["response"])
         return data
+
+    def get_webhook_delivery(self, delivery_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM api_webhook_deliveries WHERE delivery_id=?", (delivery_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_webhook_delivery(self, payload: dict[str, Any]) -> None:
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO api_webhook_deliveries VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    payload["delivery_id"], payload["event_name"], payload["payload_sha"],
+                    payload["workspace_id"], payload["status"], payload.get("job_id"),
+                    payload["created_at"], self._json(payload.get("response") or {}),
+                ),
+            )
+            self.db.commit()
+
+    def claim_webhook_delivery(self, payload: dict[str, Any]) -> tuple[bool, dict[str, Any] | None]:
+        """Atomically reserve a GitHub delivery ID for at-least-once ingress."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM api_webhook_deliveries WHERE delivery_id=?",
+                (payload["delivery_id"],),
+            ).fetchone()
+            if row:
+                existing = dict(row)
+                if existing["payload_sha"] != payload["payload_sha"] or existing["event_name"] != payload["event_name"]:
+                    raise ValueError("delivery id was already used for a different payload")
+                return False, existing
+            self.db.execute(
+                "INSERT INTO api_webhook_deliveries VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    payload["delivery_id"], payload["event_name"], payload["payload_sha"],
+                    payload["workspace_id"], payload["status"], payload.get("job_id"),
+                    payload["created_at"], self._json(payload.get("response") or {}),
+                ),
+            )
+            self.db.commit()
+            return True, None
+
+    def mark_report_stale(self, report_id: str, current_head: str, reason: str) -> None:
+        with self.lock:
+            self.db.execute(
+                "INSERT OR REPLACE INTO api_report_staleness(report_id,current_head,reason,observed_at) VALUES (?,?,?,?)",
+                (report_id, current_head, reason, utc_now()),
+            )
+            self.db.commit()
+
+    def report_staleness(self, report_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.db.execute(
+                "SELECT * FROM api_report_staleness WHERE report_id=?", (report_id,)
+            ).fetchone()
+        return dict(row) if row else None
 
     def bind_acl(self, resource_kind: str, resource_id: str, workspace_id: str) -> None:
         """Bind an immutable API resource to one workspace namespace."""
@@ -696,7 +811,7 @@ def _acl_resource_from_path(path: str) -> tuple[str, str] | None:
     mapping = {
         "tasks": "task", "intakes": "intake", "jobs": "job", "candidates": "candidate",
         "contracts": "contract", "verifications": "verification", "findings": "finding",
-        "reports": "report", "publications": "publication",
+        "reports": "report", "publications": "publication", "artifacts": "artifact",
     }
     kind = mapping.get(parts[2])
     if kind:
@@ -794,6 +909,87 @@ def _error_payload(request: Request, exc: APIError) -> JSONResponse:
     return JSONResponse(body, status_code=exc.status_code, headers={"X-Request-ID": _rid(request)})
 
 
+def _artifact_path(record: Mapping[str, Any]) -> tuple[Path, os.stat_result]:
+    """Resolve a registered artifact and fail closed on path/link changes."""
+    raw_path = Path(str(record.get("path") or ""))
+    root = _evidence_store().root.resolve()
+    try:
+        path = raw_path.resolve(strict=True)
+    except (FileNotFoundError, OSError) as exc:
+        raise APIError(404, "artifact_not_found", "artifact file does not exist") from exc
+    if not path.is_relative_to(root) or not path.is_file():
+        raise APIError(404, "artifact_not_found", "artifact file is not readable")
+    # System-level aliases such as macOS ``/var -> /private/var`` are valid
+    # path prefixes.  Only reject the final link and components *inside* the
+    # artifact root, where a mutable link could redirect an evidence read.
+    if raw_path.is_symlink():
+        raise APIError(404, "artifact_not_found", "artifact file is not readable")
+    relative = path.relative_to(root)
+    cursor = root
+    for component in relative.parts[:-1]:
+        cursor = cursor / component
+        if cursor.is_symlink():
+            raise APIError(404, "artifact_not_found", "artifact file is not readable")
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        stat = os.fstat(fd)
+        os.close(fd)
+    except (FileNotFoundError, NotADirectoryError, PermissionError, OSError) as exc:
+        if isinstance(exc, OSError) and exc.errno not in {None, 2, 13, 20, 40}:
+            raise
+        raise APIError(404, "artifact_not_found", "artifact file is not readable") from exc
+    if not stat or not statlib.S_ISREG(stat.st_mode):
+        raise APIError(404, "artifact_not_found", "artifact file is not a regular file")
+    if int(record.get("size", -1)) != stat.st_size:
+        raise APIError(409, "artifact_integrity_failed", "artifact size does not match its sealed metadata")
+    if stat.st_size > _MAX_DOWNLOAD_BYTES:
+        raise APIError(413, "artifact_too_large", "artifact exceeds the download size limit")
+    return path, stat
+
+
+def _read_artifact_bytes(record: Mapping[str, Any]) -> tuple[Path, bytes]:
+    """Read through an O_NOFOLLOW descriptor and verify the sealed digest."""
+    path, stat = _artifact_path(record)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+        try:
+            raw = b""
+            remaining = stat.st_size
+            chunks: list[bytes] = []
+            while remaining:
+                chunk = os.read(fd, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            final_stat = os.fstat(fd)
+        finally:
+            os.close(fd)
+    except (FileNotFoundError, NotADirectoryError, PermissionError, OSError) as exc:
+        raise APIError(404, "artifact_not_found", "artifact file is not readable") from exc
+    digest = hashlib.sha256(raw).hexdigest()
+    if len(raw) != int(record.get("size", -1)) or final_stat.st_size != len(raw) or not hmac.compare_digest(digest, str(record.get("sha256") or "")):
+        raise APIError(409, "artifact_integrity_failed", "artifact bytes do not match their sealed metadata")
+    return path, raw
+
+
+def _webhook_secret() -> bytes:
+    value = os.getenv("PATCHPILOT_GITHUB_WEBHOOK_SECRET", "")
+    if not value:
+        raise APIError(503, "webhook_secret_not_configured", "GitHub webhook secret is not configured")
+    return value.encode("utf-8")
+
+
+def _verify_github_signature(secret: bytes, body: bytes, supplied: str | None) -> bool:
+    if not supplied or not re.fullmatch(r"sha256=[0-9a-fA-F]{64}", supplied):
+        return False
+    expected = "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, supplied)
+
+
 def _task_dict(task: Task) -> dict[str, Any]:
     return task.to_dict()
 
@@ -818,6 +1014,97 @@ def _verification_dict(store, verification: Verification) -> dict[str, Any]:
 @router.get("/health")
 def v1_health(request: Request):
     return _result(request, {"status": "ok", "service": "patchpilot-api", "api_version": "v1", "python": platform.python_version()})
+
+
+@router.post("/webhooks/github", status_code=202)
+async def github_webhook(request: Request):
+    """Verify and enqueue a GitHub webhook using the original request bytes.
+
+    Delivery IDs are the idempotency key supplied by GitHub.  A replay of the
+    same signed delivery returns the original job reference and never creates
+    a second queue item; reusing an ID for different bytes is rejected.
+    """
+    raw = await request.body()
+    if len(raw) > _WEBHOOK_MAX_BODY_BYTES:
+        raise APIError(413, "webhook_payload_too_large", "webhook payload exceeds the 2 MiB limit")
+    delivery_id = request.headers.get("X-GitHub-Delivery", "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}", delivery_id):
+        raise APIError(422, "invalid_delivery_id", "X-GitHub-Delivery is required and has an invalid format")
+    event_name = request.headers.get("X-GitHub-Event", "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9_:-]{1,80}", event_name):
+        raise APIError(422, "invalid_webhook_event", "X-GitHub-Event is required and has an invalid format")
+    try:
+        secret = _webhook_secret()
+    except APIError:
+        raise
+    if not _verify_github_signature(secret, raw, request.headers.get("X-Hub-Signature-256")):
+        raise APIError(401, "invalid_webhook_signature", "GitHub webhook signature is invalid")
+    try:
+        payload = json.loads(raw.decode("utf-8")) if raw else {}
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise APIError(400, "invalid_webhook_payload", "GitHub webhook payload must be valid UTF-8 JSON") from exc
+    if not isinstance(payload, dict):
+        raise APIError(400, "invalid_webhook_payload", "GitHub webhook payload must be a JSON object")
+    workspace = _workspace_for_request(request)
+    resources = _resources()
+    payload_sha = hashlib.sha256(raw).hexdigest()
+    job_id = f"job_{uuid.uuid4().hex}"
+    created_at = utc_now()
+    delivery = {
+        "delivery_id": delivery_id,
+        "event_name": event_name,
+        "payload_sha": payload_sha,
+        "workspace_id": workspace,
+        "status": "accepted",
+        "job_id": job_id,
+        "created_at": created_at,
+        "response": {"event": event_name, "payload_sha": payload_sha},
+    }
+    try:
+        claimed, existing = resources.claim_webhook_delivery(delivery)
+    except ValueError as exc:
+        raise APIError(409, "webhook_delivery_conflict", str(exc)) from exc
+    if not claimed:
+        if not hmac.compare_digest(str(existing.get("workspace_id") or ""), workspace):
+            raise APIError(404, "webhook_not_found", "webhook delivery does not exist or is not visible")
+        return _result(request, {
+            "status": "duplicate",
+            "delivery_id": delivery_id,
+            "event": event_name,
+            "job_id": existing.get("job_id"),
+            "idempotent_replay": True,
+        }, 202)
+    resources.put_job({
+        "job_id": job_id,
+        "kind": "github_webhook",
+        "state": "queued",
+        "resource_id": delivery_id,
+        "created_at": created_at,
+        "updated_at": created_at,
+        "event": event_name,
+        "payload_sha": payload_sha,
+    })
+    resources.bind_acl("job", job_id, workspace)
+    # synchronize events are an explicit signal that the previous PR head is
+    # stale.  We only persist this observation; a fresh verification remains
+    # a separate, user-visible action and no report is silently rewritten.
+    if event_name == "pull_request" and str(payload.get("action") or "").lower() == "synchronize":
+        pr = payload.get("pull_request") if isinstance(payload.get("pull_request"), dict) else {}
+        repo = payload.get("repository") if isinstance(payload.get("repository"), dict) else {}
+        repo_id = ((repo.get("full_name") or "") if isinstance(repo, dict) else "")
+        number = pr.get("number") or payload.get("number")
+        head = ((pr.get("head") or {}).get("sha") if isinstance(pr.get("head"), dict) else None) or "unknown"
+        if repo_id and number:
+            for report in resources.list_reports_for_repo_pr(repo_id, int(number)):
+                resources.mark_report_stale(report["report_id"], str(head), "github_pull_request_synchronize")
+    return _result(request, {
+        "status": "accepted",
+        "delivery_id": delivery_id,
+        "event": event_name,
+        "job_id": job_id,
+        "payload_sha": payload_sha,
+        "idempotent_replay": False,
+    }, 202)
 
 
 @router.get("/tasks")
@@ -1332,6 +1619,35 @@ def list_findings(task_id: str, request: Request, candidate_id: str | None = Non
     })
 
 
+@router.post("/tasks/{task_id}/probe-plan")
+def create_probe_plan(task_id: str, body: ProbePlanCreate, request: Request):
+    """Return a bounded probe plan for a real task.
+
+    Planning is intentionally separate from execution.  The plan is derived
+    from a caller-provided seed and is capped before it reaches a runner; an
+    oracle or execution worker must later record measured observations and
+    classify them.  This endpoint never claims that a generated input found
+    a counterexample.
+    """
+    store = _evidence_store()
+    task = store.get_task(task_id)
+    if not task:
+        raise APIError(404, "task_not_found", "task does not exist or is not visible")
+    try:
+        cases = generate_boundary_inputs(body.seed, max_cases=body.max_cases)
+    except ValueError as exc:
+        raise APIError(422, "invalid_probe_plan", str(exc)) from exc
+    return _result(request, {
+        "task_id": task_id,
+        "oracle_id": body.oracle_id,
+        "bounded": True,
+        "max_cases": body.max_cases,
+        "status": "planned",
+        "cases": [{"value": case.value, "label": case.label, "input_hash": case.input_hash} for case in cases],
+        "disclosure": "A plan is not evidence; execute each case under the frozen contract and preserve repeats before classifying it.",
+    }, 201)
+
+
 @router.get("/findings/{finding_id}")
 def get_finding(finding_id: str, request: Request):
     finding = _evidence_store().get_finding(finding_id)
@@ -1477,9 +1793,62 @@ def list_reports(task_id: str, request: Request):
     if not _evidence_store().get_task(task_id):
         raise APIError(404, "task_not_found", "task does not exist or is not visible")
     items = []
-    for row in _resources().list_reports(task_id):
+    resources = _resources()
+    for row in resources.list_reports(task_id):
+        stale = resources.report_staleness(row["report_id"])
         items.append({key: row[key] for key in ("report_id", "task_id", "verification_id", "verification_key", "format", "content_type", "content_sha", "created_at")})
+        if stale:
+            items[-1]["validity"] = Validity.STALE.value
+            items[-1]["stale_reason"] = stale["reason"]
     return _result(request, {"items": items})
+
+
+@router.get("/artifacts/{link_id}/download")
+def download_artifact(link_id: str, request: Request):
+    """Download one sealed artifact after ACL, path and digest checks."""
+    record = _evidence_store().get_artifact(link_id)
+    if not record:
+        raise APIError(404, "artifact_not_found", "artifact does not exist or is not visible")
+    path, raw = _read_artifact_bytes(record)
+    filename = path.name
+    # ``write_artifact`` already enforces a single safe filename component;
+    # keep this defense at the HTTP boundary in case of legacy rows.
+    if filename in {"", ".", ".."} or any(ch in filename for ch in ("/", "\\", "\x00", "\r", "\n")):
+        raise APIError(404, "artifact_not_found", "artifact filename is not safe")
+    media_type = "application/octet-stream"
+    if filename.endswith(".json"):
+        media_type = "application/json"
+    elif filename.endswith(".md"):
+        media_type = "text/markdown; charset=utf-8"
+    elif filename.endswith(".html"):
+        media_type = "text/html; charset=utf-8"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "X-Artifact-SHA256": str(record.get("sha256") or ""),
+        "X-Artifact-Size": str(len(raw)),
+        "X-Request-ID": _rid(request),
+    }
+    return Response(content=raw, media_type=media_type, headers=headers)
+
+
+@router.get("/runs/{run_id}/bundle-check")
+def check_run_bundle(run_id: str, request: Request):
+    """Verify all sealed artifacts for a legacy run without mutating state."""
+    result = _evidence_store().check_artifacts(run_id)
+    if not _evidence_store().get_run(run_id) and result["artifact_count"] == 0:
+        raise APIError(404, "run_not_found", "run does not exist or is not visible")
+    return _result(request, {"bundle": result, **result})
+
+
+@router.post("/bundles/check")
+def check_bundle(body: dict[str, Any], request: Request):
+    run_id = body.get("run_id")
+    if not isinstance(run_id, str) or not _ID_RE.fullmatch(run_id):
+        raise APIError(422, "invalid_run_id", "run_id must be a safe identifier")
+    result = _evidence_store().check_artifacts(run_id)
+    if not _evidence_store().get_run(run_id) and result["artifact_count"] == 0:
+        raise APIError(404, "run_not_found", "run does not exist or is not visible")
+    return _result(request, {"bundle": result, **result})
 
 
 @router.post("/verifications/{verification_id}/reports", status_code=201)
@@ -1571,27 +1940,44 @@ def create_report(verification_id: str, body: dict[str, Any], request: Request):
 
 @router.get("/reports/{report_id}")
 def get_report(report_id: str, request: Request):
-    report = _resources().get_report(report_id)
+    resources = _resources()
+    report = resources.get_report(report_id)
     if not report:
         raise APIError(404, "report_not_found", "report does not exist or is not visible")
-    return _result(request, {"report": {key: report[key] for key in ("report_id", "task_id", "verification_id", "verification_key", "format", "content_type", "content_sha", "snapshot", "created_at")}})
+    public = {key: report[key] for key in ("report_id", "task_id", "verification_id", "verification_key", "format", "content_type", "content_sha", "snapshot", "created_at")}
+    stale = resources.report_staleness(report_id)
+    if stale:
+        public["validity"] = Validity.STALE.value
+        public["stale_reason"] = stale["reason"]
+        snapshot = dict(public["snapshot"])
+        verification = dict(snapshot.get("verification") or {})
+        verification["validity"] = Validity.STALE.value
+        snapshot["verification"] = verification
+        public["snapshot"] = snapshot
+    return _result(request, {"report": public})
 
 
 @router.get("/reports/{report_id}/content")
 def get_report_content(report_id: str, request: Request):
-    report = _resources().get_report(report_id)
+    resources = _resources()
+    report = resources.get_report(report_id)
     if not report:
         raise APIError(404, "report_not_found", "report does not exist or is not visible")
     # Keep this JSON for the console's typed API and for clients that need to
     # render the report inline.  The digest and content type still make the
     # bytes suitable for a verified download/export step.
-    return _result(request, {
+    payload = {
         "report_id": report_id,
         "format": report["format"],
         "content_type": report["content_type"],
         "content": report["content"],
         "content_sha": report["content_sha"],
-    }, 200)
+    }
+    stale = resources.report_staleness(report_id)
+    if stale:
+        payload["validity"] = Validity.STALE.value
+        payload["stale_reason"] = stale["reason"]
+    return _result(request, payload, 200)
 
 
 def _publication_error(exc: SourceResolutionError) -> APIError:
@@ -1649,6 +2035,8 @@ def create_publication_preview(report_id: str, body: PublishPreviewCreate, reque
     report = _resources().get_report(report_id)
     if not report:
         raise APIError(404, "report_not_found", "report does not exist or is not visible")
+    if _resources().report_staleness(report_id):
+        raise APIError(409, "report_stale", "stale reports cannot be published; create a new verification")
     snapshot_verification = (report.get("snapshot") or {}).get("verification") or {}
     if snapshot_verification.get("validity") == Validity.STALE.value:
         raise APIError(409, "report_stale", "stale reports cannot be published; create a new verification")

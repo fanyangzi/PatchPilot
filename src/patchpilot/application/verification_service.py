@@ -69,6 +69,27 @@ _SAFE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}$")
 _SAFE_EXECUTABLES = frozenset({
     "pytest", "python", "python3", "uv", "ruff", "node", "npm", "pnpm", "yarn",
 })
+
+
+def _bounded_limit(name: str, default: int, minimum: int, maximum: int) -> int:
+    """Read a defensive archive limit without allowing unsafe configuration."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+# Git archives are untrusted input when a candidate references a remote or
+# shared repository.  Keep both the number of entries and their expanded byte
+# size bounded so a tiny tarball cannot exhaust the temporary workspace.
+_ARCHIVE_MAX_MEMBERS = _bounded_limit("PATCHPILOT_ARCHIVE_MAX_MEMBERS", 50_000, 1, 1_000_000)
+_ARCHIVE_MAX_EXPANDED_BYTES = _bounded_limit(
+    "PATCHPILOT_ARCHIVE_MAX_EXPANDED_BYTES", 256 * 1024 * 1024, 1, 4 * 1024 * 1024 * 1024
+)
+_ARCHIVE_MAX_TAR_BYTES = _bounded_limit(
+    "PATCHPILOT_ARCHIVE_MAX_TAR_BYTES", 256 * 1024 * 1024, 1, 4 * 1024 * 1024 * 1024
+)
 _SUMMARY_RE = re.compile(
     r"(?P<count>\d+)\s+(?P<kind>passed|failed|error|errors?|skipped|xfailed|xpassed|deselected)",
     re.IGNORECASE,
@@ -262,13 +283,22 @@ class VerificationService:
         )
         if archive.returncode != 0:
             raise VerificationExecutionError("base snapshot could not be materialized")
+        # ``git archive`` is captured in memory.  Reject an oversized tar
+        # before opening it, then enforce the expanded limit while walking
+        # members so sparse/deflated archives cannot become workspace bombs.
+        if len(archive.stdout) > _ARCHIVE_MAX_TAR_BYTES:
+            raise VerificationExecutionError("base snapshot archive exceeds the compressed size limit")
         destination.mkdir(parents=True, exist_ok=True)
         destination = destination.resolve()
         with tarfile.open(fileobj=BytesIO(archive.stdout), mode="r:") as tar:
             # Git archives can contain symlinks/hardlinks.  Never materialize
             # archive entries that could escape the disposable workspace or
             # redirect a test process to an untrusted host path.
-            for member in tar.getmembers():
+            members = tar.getmembers()
+            if len(members) > _ARCHIVE_MAX_MEMBERS:
+                raise VerificationExecutionError("base snapshot contains too many archive entries")
+            expanded_bytes = 0
+            for member in members:
                 name = member.name.replace("\\", "/").rstrip("/")
                 target = (destination / name).resolve()
                 if not name or name.startswith("/") or any(part in {"", ".", ".."} for part in name.split("/")):
@@ -279,6 +309,11 @@ class VerificationService:
                     raise VerificationExecutionError("base snapshot contains an unsupported link entry")
                 if not (member.isfile() or member.isdir()):
                     raise VerificationExecutionError("base snapshot contains an unsupported archive entry")
+                if member.size < 0:
+                    raise VerificationExecutionError("base snapshot contains an invalid archive size")
+                expanded_bytes += int(member.size)
+                if expanded_bytes > _ARCHIVE_MAX_EXPANDED_BYTES:
+                    raise VerificationExecutionError("base snapshot exceeds the expanded size limit")
                 tar.extract(member, destination, filter="data")
 
     @staticmethod
