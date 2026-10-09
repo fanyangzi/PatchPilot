@@ -328,6 +328,17 @@ class FindingProbeCreate(FindingReproduceCreate):
     input: Any
     repeats: int = Field(default=1, ge=1, le=1)
 
+    @field_validator("input")
+    @classmethod
+    def validate_probe_input_size(cls, value: Any) -> Any:
+        try:
+            encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("input must be finite JSON data") from exc
+        if len(encoded) > 64 * 1024:
+            raise ValueError("input must be at most 64 KiB")
+        return value
+
 
 class ProbePlanCreate(APIModel):
     """Request a bounded, deterministic counterexample probe plan."""
@@ -353,6 +364,17 @@ class FindingShrinkCreate(APIModel):
     input: Any
     oracle: dict[str, Any]
     max_steps: int = Field(default=32, ge=1, le=128)
+
+    @field_validator("input")
+    @classmethod
+    def validate_input_size(cls, value: Any) -> Any:
+        try:
+            encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("input must be finite JSON data") from exc
+        if len(encoded) > 64 * 1024:
+            raise ValueError("input must be at most 64 KiB")
+        return value
 
     @field_validator("oracle")
     @classmethod
