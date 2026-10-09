@@ -83,6 +83,10 @@ def test_v1_only_lists_durable_tasks_and_creates_real_local_patch_candidate(api_
     candidate = candidate_response.json()["candidate"]
     assert candidate["patch_hash"] == hashlib.sha256(patch.encode()).hexdigest()
     assert client.get(f"/api/v1/candidates/{candidate['candidate_id']}/diff").json()["content"] == patch
+    inbox = client.get("/api/v1/inbox").json()["items"][0]
+    assert inbox["task"]["task_id"] == task["task_id"]
+    assert inbox["candidate"]["candidate_id"] == candidate["candidate_id"]
+    assert inbox["candidate_count"] == 1
 
 
 def test_task_graph_exposes_provenance_and_supports_focus(api_client):
