@@ -624,8 +624,9 @@ class _ResourceStore:
             except (TypeError, json.JSONDecodeError):
                 continue
             issue = ((data.get("snapshot") or {}).get("task") or {}).get("issue_snapshot") or {}
-            issue_repo = issue.get("repo_id") or issue.get("repository")
-            issue_number = issue.get("pr_number") or issue.get("number")
+            resolved = issue.get("resolved_refs") if isinstance(issue.get("resolved_refs"), Mapping) else {}
+            issue_repo = issue.get("repo_id") or issue.get("repository") or resolved.get("repo_id")
+            issue_number = issue.get("pr_number") or issue.get("number") or resolved.get("pr_number") or resolved.get("number")
             if str(issue_repo).lower() == str(repo_id).lower() and str(issue_number) == str(pr_number):
                 result.append(data)
         return result
@@ -977,7 +978,7 @@ def _read_artifact_bytes(record: Mapping[str, Any]) -> tuple[Path, bytes]:
 
 
 def _webhook_secret() -> bytes:
-    value = os.getenv("PATCHPILOT_GITHUB_WEBHOOK_SECRET", "")
+    value = os.getenv("PATCHPILOT_GITHUB_WEBHOOK_SECRET") or os.getenv("GITHUB_WEBHOOK_SECRET", "")
     if not value:
         raise APIError(503, "webhook_secret_not_configured", "GitHub webhook secret is not configured")
     return value.encode("utf-8")
