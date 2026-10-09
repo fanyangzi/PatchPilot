@@ -2132,6 +2132,8 @@ def publish_report(report_id: str, body: PublishCreate, request: Request):
     report = _resources().get_report(report_id)
     if not report:
         raise APIError(404, "report_not_found", "report does not exist or is not visible")
+    if _resources().report_staleness(report_id):
+        raise APIError(409, "report_stale", "stale reports cannot be published; create a new verification")
     snapshot_verification = (report.get("snapshot") or {}).get("verification") or {}
     if snapshot_verification.get("validity") == Validity.STALE.value:
         raise APIError(409, "report_stale", "stale reports cannot be published; create a new verification")
