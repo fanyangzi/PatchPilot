@@ -470,6 +470,105 @@ def test_execution_persists_traceable_candidate_failure_finding(api_client, tmp_
     assert detail.json()["finding"]["finding_id"] == finding["finding_id"]
 
 
+def _create_candidate_failure_for_followup(client, tmp_path, monkeypatch):
+    repo, base_sha, _ = _temporary_git_repository(tmp_path)
+    subprocess.run(["git", "checkout", "--", "calc.py"], cwd=repo, check=True)
+    (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    bad_patch = subprocess.check_output(["git", "diff", "--", "calc.py"], cwd=repo, text=True)
+    monkeypatch.setenv("PATCHPILOT_WORKSPACE_ROOTS", str(tmp_path))
+    queued, task, candidate, contract_id = _queue_verification_for_execution(client, base_sha, bad_patch)
+    executed = client.post(
+        f"/api/v1/verifications/{queued['verification_id']}/execute",
+        json={"repo_path": str(repo), "command_argv": [["pytest", "-q"]], "suite_id": "pytest-default"},
+    )
+    assert executed.status_code == 201
+    findings = [item for item in executed.json()["findings"] if item["kind"] == "candidate_failure"]
+    assert findings
+    return repo, base_sha, task, candidate, contract_id, findings[0]
+
+
+def test_finding_reproduction_repeats_same_contract_and_marks_flaky(api_client, tmp_path, monkeypatch):
+    client, _ = api_client
+    repo, _, task, _, _, finding = _create_candidate_failure_for_followup(client, tmp_path, monkeypatch)
+    counter = tmp_path / "repeat-counter"
+    script = (
+        "from pathlib import Path; import sys; "
+        f"p=Path({str(counter)!r}); n=int(p.read_text() if p.exists() else '0'); p.write_text(str(n+1)); "
+        "ok=(n//2)%2==0; print('1 passed' if ok else '1 failed'); sys.exit(0 if ok else 1)"
+    )
+    response = client.post(f"/api/v1/findings/{finding['finding_id']}/reproduce", json={
+        "repeats": 2, "repo_path": str(repo),
+        "command_argv": [[sys.executable, "-c", script]], "suite_id": "repeat-suite",
+    })
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["flaky"] is True
+    assert len(body["repetitions"]) == 2
+    summary = body["result"]["verification"]
+    assert summary["verdict"] == "inconclusive"
+    assert "flaky_repeats" in summary["gaps"]
+    assert any(item["kind"] == "flaky" for item in body["result"]["findings"])
+    job = client.get(f"/api/v1/jobs/{body['job_id']}").json()["job"]
+    assert job["state"] == "completed"
+    assert client.get(f"/api/v1/tasks/{task['task_id']}/findings").status_code == 200
+
+
+def test_repair_requires_explicit_approval_and_creates_child_candidate(api_client, tmp_path, monkeypatch):
+    client, _ = api_client
+    repo, base_sha, task, parent, _, finding = _create_candidate_failure_for_followup(client, tmp_path, monkeypatch)
+    rejected = client.post(f"/api/v1/tasks/{task['task_id']}/repairs", json={
+        "parent_candidate_id": parent["candidate_id"], "finding_ids": [finding["finding_id"]],
+        "max_budget": 2, "actor": "maintainer", "approved": False,
+    })
+    assert rejected.status_code == 409
+    assert rejected.json()["error"]["code"] == "repair_approval_required"
+
+    from patchpilot.adapters.remote import RemoteModel
+    repair_patch = (
+        "diff --git a/calc.py b/calc.py\n"
+        "--- a/calc.py\n+++ b/calc.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def add(a, b):\n"
+        "-    return a + b\n"
+        "+    return a - b\n"
+    )
+    monkeypatch.setattr(RemoteModel, "propose_patch", lambda self, task, repo_files, failed_tests: repair_patch)
+    created = client.post(f"/api/v1/tasks/{task['task_id']}/repairs", json={
+        "parent_candidate_id": parent["candidate_id"], "finding_ids": [finding["finding_id"]],
+        "max_budget": 2, "actor": "maintainer", "approved": True,
+        "repo_files": {"calc.py": "def add(a, b):\n    return a + b\n"},
+    })
+    assert created.status_code == 202
+    body = created.json()
+    assert body["status"] == "completed"
+    assert body["contract_unchanged"] is True
+    child = body["candidate"]
+    assert child["candidate_id"] != parent["candidate_id"]
+    assert child["parent_candidate_id"] == parent["candidate_id"]
+    assert child["author_type"] == "remote_model"
+    assert client.get(f"/api/v1/candidates/{child['candidate_id']}/diff").json()["content"] == repair_patch
+    assert client.get(f"/api/v1/jobs/{body['job_id']}").json()["job"]["state"] == "completed"
+
+
+def test_repair_provider_failure_is_explicit_and_does_not_create_candidate(api_client, tmp_path, monkeypatch):
+    client, _ = api_client
+    _, _, task, parent, _, finding = _create_candidate_failure_for_followup(client, tmp_path, monkeypatch)
+    from patchpilot.adapters.remote import RemoteModel
+    monkeypatch.setattr(RemoteModel, "propose_patch", lambda self, task, repo_files, failed_tests: (_ for _ in ()).throw(RuntimeError("provider offline")))
+    response = client.post(f"/api/v1/tasks/{task['task_id']}/repairs", json={
+        "parent_candidate_id": parent["candidate_id"], "finding_ids": [finding["finding_id"]],
+        "max_budget": 1, "actor": "maintainer", "approved": True,
+    })
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "error"
+    assert body["error"]["code"] == "repair_provider_error"
+    assert body["contract_unchanged"] is True
+    assert client.get(f"/api/v1/jobs/{body['job_id']}").json()["job"]["state"] == "error"
+    assert len(client.get(f"/api/v1/tasks/{task['task_id']}/candidates").json()["items"]) == 1
+
+
 def test_findings_keep_baseline_failure_and_inconclusive_outcomes(tmp_path):
     """Derivation records each non-pass observation without claiming success."""
     from patchpilot.domain.entities import (

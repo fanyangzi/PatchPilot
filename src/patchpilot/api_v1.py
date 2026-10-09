@@ -25,6 +25,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, Mapping
 from urllib.parse import urlparse
 
@@ -36,6 +37,7 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, mod
 from .domain.entities import (
     AcceptanceCondition,
     Candidate,
+    CheckOutcome,
     ContractState,
     ContractVersion,
     ReviewDecision,
@@ -56,6 +58,8 @@ from .application.verification_service import (
     WorkspaceResolutionError,
 )
 from .application.job_worker import DurableJobStore
+from .domain.entities import CheckExecution
+from .verifier.diff import parse_unified_diff
 from .integrations.github_source import GitHubSourceResolver, SourceResolutionError
 
 
@@ -287,6 +291,72 @@ class VerificationExecute(APIModel):
         if value is not None and ("\x00" in value or not value.strip()):
             raise ValueError("repo_path must be a non-empty path without NUL bytes")
         return value
+
+
+class FindingReproduceCreate(APIModel):
+    """Bounded re-execution of one persisted finding's verification evidence."""
+
+    repeats: int = Field(default=3, ge=1, le=3)
+    repo_id: str | None = None
+    repo_path: str | None = None
+    command_argv: list[list[str]] | None = None
+    suite_id: str | None = None
+
+    @field_validator("repo_id", "suite_id")
+    @classmethod
+    def validate_reproduce_ids(cls, value: str | None, info) -> str | None:
+        return _valid_id(value, info.field_name) if value is not None else None
+
+    @field_validator("repo_path")
+    @classmethod
+    def validate_reproduce_path(cls, value: str | None) -> str | None:
+        if value is not None and ("\x00" in value or not value.strip()):
+            raise ValueError("repo_path must be a non-empty path without NUL bytes")
+        return value
+
+
+class RepairCreate(APIModel):
+    """Explicitly approved, bounded candidate repair request.
+
+    Context files are supplied by the caller as read-only model input.  The
+    repair provider has no write access to the contract, suite, or workspace.
+    """
+
+    parent_candidate_id: str
+    finding_ids: list[str] = Field(min_length=1, max_length=16)
+    max_budget: int = Field(ge=1, le=3)
+    approved: bool = False
+    actor: str = Field(min_length=1, max_length=200)
+    provider: Literal["remote"] = "remote"
+    repo_files: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("parent_candidate_id")
+    @classmethod
+    def validate_parent_candidate(cls, value: str) -> str:
+        return _valid_id(value, "parent_candidate_id")
+
+    @field_validator("finding_ids")
+    @classmethod
+    def validate_finding_ids(cls, value: list[str]) -> list[str]:
+        result = [_valid_id(item, "finding_id") for item in value]
+        return list(dict.fromkeys(result))
+
+    @field_validator("repo_files")
+    @classmethod
+    def validate_repo_files(cls, value: dict[str, str]) -> dict[str, str]:
+        if len(value) > 32:
+            raise ValueError("repo_files may contain at most 32 entries")
+        normalized: dict[str, str] = {}
+        for path, content in value.items():
+            if not isinstance(path, str) or not path or "\x00" in path:
+                raise ValueError("repo_files contains an invalid path")
+            parts = path.replace("\\", "/").split("/")
+            if path.startswith(("/", "\\")) or ".." in parts:
+                raise ValueError("repo_files paths must stay inside the workspace")
+            if not isinstance(content, str) or len(content.encode("utf-8")) > 50_000:
+                raise ValueError("repo_files entries must be UTF-8 text under 50 KiB")
+            normalized[path] = content
+        return normalized
 
 
 class DecisionCreate(APIModel):
@@ -1137,6 +1207,122 @@ def get_finding(finding_id: str, request: Request):
     return _result(request, {"finding": finding.to_dict()})
 
 
+@router.post("/findings/{finding_id}/reproduce", status_code=202)
+def reproduce_finding(finding_id: str, body: FindingReproduceCreate, request: Request):
+    """Repeat one finding under the same immutable candidate/contract.
+
+    Every repetition creates a new verification snapshot.  If observations
+    differ, a separate flaky summary snapshot is appended with a ``flaky``
+    check; no passing repetition is selected as the answer.
+    """
+    store = _evidence_store()
+    finding = store.get_finding(finding_id)
+    if not finding:
+        raise APIError(404, "finding_not_found", "finding does not exist or is not visible")
+    source = store.get_verification(finding.verification_id)
+    candidate = store.get_candidate(finding.candidate_id)
+    contract = store.get_contract_version(finding.contract_id, finding.contract_revision)
+    if not source or not candidate or not contract:
+        raise APIError(409, "finding_snapshot_incomplete", "finding references unavailable immutable resources")
+    if source.candidate_id != finding.candidate_id or source.contract_id != finding.contract_id:
+        raise APIError(409, "finding_snapshot_mismatch", "finding references do not match its verification")
+
+    related_checks = {
+        check.check_id: check
+        for check in store.list_check_executions(finding.verification_id)
+    }
+    source_checks = [related_checks[item] for item in finding.check_ids if item in related_checks]
+    if body.command_argv is None:
+        argv = [list(item.command_argv) for item in source_checks if item.command_argv]
+        command_argv = argv or [["pytest", "-q"]]
+    else:
+        command_argv = body.command_argv
+    suite_id = body.suite_id or (source_checks[0].suite_id if source_checks else "reproduce-suite")
+
+    created = utc_now()
+    job_id = f"job_{uuid.uuid4().hex}"
+    queue = _resources().jobs
+    queue.create({
+        "job_id": job_id, "kind": "finding_reproduce", "state": "queued",
+        "resource_id": finding.verification_id, "created_at": created, "updated_at": created,
+        "finding_id": finding_id, "repeats": body.repeats,
+    })
+    worker_id = f"api-reproduce:{uuid.uuid4().hex}"
+    leased = queue.claim(worker_id, job_id=job_id, lease_seconds=900)
+    if not leased:
+        raise APIError(409, "reproduction_job_unavailable", "reproduction job could not be claimed")
+    repetitions: list[dict[str, Any]] = []
+    try:
+        service = VerificationService(store)
+        for _ in range(body.repeats):
+            repetitions.append(service.execute(
+                finding.verification_id,
+                repo_id=body.repo_id,
+                repo_path=body.repo_path,
+                command_argv=command_argv,
+                suite_id=suite_id,
+                cancel_checker=lambda: queue.is_cancel_requested(job_id, worker_id, leased["lease_token"]),
+            ))
+    except WorkspaceResolutionError as exc:
+        queue.complete(job_id, worker_id, leased["lease_token"], state="error", payload={"error": str(exc)})
+        raise APIError(422, "workspace_not_allowed", str(exc)) from exc
+    except VerificationExecutionError as exc:
+        queue.complete(job_id, worker_id, leased["lease_token"], state="error", payload={"error": str(exc)})
+        raise APIError(409, "reproduction_execution_error", str(exc)) from exc
+    except Exception as exc:
+        try:
+            queue.complete(job_id, worker_id, leased["lease_token"], state="error", payload={"error": "worker_failure"})
+        except Exception:
+            pass
+        raise APIError(500, "reproduction_worker_error", "finding reproduction failed") from exc
+
+    def signature(item: dict[str, Any]) -> tuple[tuple[str, str, str, int], ...]:
+        return tuple(sorted(
+            (str(check.get("variant")), str(check.get("target")), str(check.get("outcome")), int(check.get("count", 0)))
+            for check in item.get("checks", [])
+        ))
+
+    signatures = [signature(item) for item in repetitions]
+    flaky = len(set(signatures)) > 1
+    final_result = repetitions[-1]
+    if flaky:
+        summary_id = f"verification_{uuid.uuid4().hex}"
+        summary = Verification(
+            summary_id, source.verification_key, source.candidate_id, source.contract_id,
+            RunState.COMPLETED, Verdict.INCONCLUSIVE, source.contract_revision,
+            source.validity, ReviewDecision.PENDING, ("flaky_repeats",), (),
+        )
+        store.save_verification(summary)
+        summary_check = CheckExecution(
+            f"check_{uuid.uuid4().hex}", summary_id, suite_id, "reproduce", "candidate",
+            CheckOutcome.FLAKY, 0, tuple(command_argv[0]) if command_argv else (),
+            details={
+                "reason": "repeat outcomes differ",
+                "repeat_verification_ids": [item["verification"]["verification_id"] for item in repetitions],
+                "observed_signatures": [list(item) for item in signatures],
+            },
+        )
+        store.save_check_execution(summary_check)
+        findings = store.derive_findings_for_verification(summary_id)
+        final_result = {
+            "execution_id": f"reproduction_{uuid.uuid4().hex}",
+            "source_verification_id": finding.verification_id,
+            "verification": summary.to_dict(),
+            "checks": [summary_check.to_dict()],
+            "findings": [item.to_dict() for item in findings],
+        }
+
+    completed = queue.complete(job_id, worker_id, leased["lease_token"], state="completed", payload={
+        "result_verification_id": final_result["verification"]["verification_id"],
+        "repetitions": len(repetitions), "flaky": flaky,
+    })
+    return _result(request, {
+        "status": "completed", "job_id": job_id, "finding_id": finding_id,
+        "repetitions": [item["verification"] for item in repetitions],
+        "flaky": flaky, "result": final_result, "job": completed,
+    }, 202)
+
+
 @router.get("/tasks/{task_id}/reports")
 def list_reports(task_id: str, request: Request):
     if not _evidence_store().get_task(task_id):
@@ -1506,6 +1692,109 @@ def get_candidate_diff(candidate_id: str, request: Request):
     return _result(request, {"candidate_id": candidate_id, "patch_hash": candidate.patch_hash, "content": (content or {}).get("content"), "content_ref": (content or {}).get("content_ref"), "available": bool(content and content.get("content"))})
 
 
+def _validate_repair_patch(patch_text: str) -> list[str]:
+    """Validate a provider patch before it becomes a new candidate."""
+    if not patch_text or not patch_text.strip() or len(patch_text.encode("utf-8")) > _MAX_PATCH_BYTES:
+        raise ValueError("repair provider returned an empty or oversized patch")
+    try:
+        entries = parse_unified_diff(patch_text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("repair provider returned an invalid unified diff") from exc
+    if not entries:
+        raise ValueError("repair provider returned no changed files")
+    protected = ("test", "tests/", ".github/", "contract", "policy", "fixture")
+    paths: list[str] = []
+    for entry in entries:
+        path = entry.path.replace("\\", "/")
+        lower = path.lower()
+        if entry.is_binary or entry.is_mode_change:
+            raise ValueError("repair provider may not modify binary files or file modes")
+        if path.startswith("/") or ".." in path.split("/"):
+            raise ValueError("repair provider returned an unsafe path")
+        if any(lower == item or lower.startswith(item) for item in protected):
+            raise ValueError("repair provider may not modify tests, contracts, policies, fixtures, or CI files")
+        paths.append(path)
+    return paths
+
+
+@router.post("/tasks/{task_id}/repairs", status_code=202)
+def create_repair(task_id: str, body: RepairCreate, request: Request):
+    """Generate one real child candidate under an explicit budget approval."""
+    if not body.approved:
+        raise APIError(409, "repair_approval_required", "repair requires explicit approval and a bounded budget")
+    store = _evidence_store()
+    task = store.get_task(task_id)
+    if not task:
+        raise APIError(404, "task_not_found", "task does not exist or is not visible")
+    parent = store.get_candidate(body.parent_candidate_id)
+    if not parent or parent.task_id != task_id:
+        raise APIError(404, "parent_candidate_not_found", "parent candidate does not exist for this task")
+    findings = []
+    for finding_id in body.finding_ids:
+        finding = store.get_finding(finding_id)
+        if not finding or finding.task_id != task_id or finding.candidate_id != parent.candidate_id:
+            raise APIError(404, "finding_not_found", "finding does not belong to the parent candidate")
+        findings.append(finding)
+    created = utc_now()
+    job_id = f"job_{uuid.uuid4().hex}"
+    queue = _resources().jobs
+    queue.create({
+        "job_id": job_id, "kind": "candidate_repair", "state": "queued",
+        "resource_id": parent.candidate_id, "created_at": created, "updated_at": created,
+        "parent_candidate_id": parent.candidate_id, "finding_ids": body.finding_ids,
+        "max_budget": body.max_budget, "actor": body.actor, "provider": body.provider,
+    })
+    worker_id = f"api-repair:{uuid.uuid4().hex}"
+    leased = queue.claim(worker_id, job_id=job_id, lease_seconds=900)
+    if not leased:
+        raise APIError(409, "repair_job_unavailable", "repair job could not be claimed")
+    try:
+        from .adapters.remote import RemoteModel
+
+        issue = task.issue_snapshot
+        repair_task = SimpleNamespace(
+            issue_title=str(issue.get("title", "")),
+            issue_body=str(issue.get("body", "")),
+        )
+        failed_tests = [f"{item.kind}: {item.message[:500]}" for item in findings]
+        patch_text = RemoteModel().propose_patch(repair_task, dict(body.repo_files), failed_tests)
+        changed_paths = _validate_repair_patch(patch_text)
+        patch_hash = hashlib.sha256(patch_text.encode("utf-8")).hexdigest()
+        tree_digest = hashlib.sha256(f"repair-tree\0{parent.base_sha}\0{patch_hash}".encode("utf-8")).hexdigest()
+        child = Candidate(
+            f"candidate_{uuid.uuid4().hex}", task_id, parent.base_sha, None,
+            tree_digest, patch_hash, "remote_model", parent.candidate_id,
+        )
+        store.save_candidate(child)
+        _resources().put_candidate_content(child.candidate_id, patch_text, None, patch_hash)
+        completed = queue.complete(job_id, worker_id, leased["lease_token"], state="completed", payload={
+            "candidate_id": child.candidate_id, "changed_paths": changed_paths,
+            "budget_used": 1, "approved_budget": body.max_budget,
+        })
+        return _result(request, {
+            "status": "completed", "job_id": job_id, "candidate": child.to_dict(),
+            "parent_candidate_id": parent.candidate_id, "contract_unchanged": True,
+            "changed_paths": changed_paths, "job": completed,
+        }, 202)
+    except ValueError as exc:
+        queue.complete(job_id, worker_id, leased["lease_token"], state="error", payload={"error": str(exc), "provider": body.provider})
+        return _result(request, {
+            "status": "error", "job_id": job_id,
+            "error": {"code": "repair_protocol_error", "message": str(exc)},
+            "parent_candidate_id": parent.candidate_id, "contract_unchanged": True,
+        }, 202)
+    except Exception as exc:
+        try:
+            queue.complete(job_id, worker_id, leased["lease_token"], state="error", payload={"error": "repair_provider_error", "provider": body.provider})
+        except Exception:
+            pass
+        return _result(request, {
+            "status": "error", "job_id": job_id,
+            "error": {"code": "repair_provider_error", "message": "repair provider unavailable"},
+            "parent_candidate_id": parent.candidate_id, "contract_unchanged": True,
+        }, 202)
+
+
 @router.post("/tasks/{task_id}/verifications", status_code=202)
 def create_verification(task_id: str, body: VerificationCreate, request: Request):
     store = _evidence_store()
@@ -1647,6 +1936,7 @@ def execute_verification(verification_id: str, body: VerificationExecute, reques
             repo_path=body.repo_path,
             command_argv=execution_commands,
             suite_id=execution_suite,
+            cancel_checker=lambda: queue.is_cancel_requested(row["job_id"], worker_id, leased["lease_token"]),
         )
     except WorkspaceResolutionError as exc:
         queue.complete(row["job_id"], worker_id, leased["lease_token"], state="error", payload={"error": str(exc)})
@@ -1670,7 +1960,11 @@ def execute_verification(verification_id: str, body: VerificationExecute, reques
     # instead of claiming that an execution completed when the worker recorded
     # an explicit error snapshot.
     execution_status = result.get("verification", {}).get("run_state", "completed")
-    queue_state = "completed" if execution_status == RunState.COMPLETED.value else "error"
+    queue_state = (
+        "completed" if execution_status == RunState.COMPLETED.value
+        else "cancelled" if execution_status == RunState.CANCELLED.value
+        else "error"
+    )
     queue.complete(row["job_id"], worker_id, leased["lease_token"], state=queue_state, payload={
         "result_verification_id": result.get("verification", {}).get("verification_id"),
         "execution_id": result.get("execution_id"),
