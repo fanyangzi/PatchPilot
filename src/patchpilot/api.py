@@ -7,6 +7,7 @@ from .domain.models import Event, Run, compute_event_hash, compute_verdict_hash,
 from .evidence import EvidenceStore
 from .orchestrator import PatchPilot
 from .skills import SkillRegistry
+from .api_v1 import install_api_v1, router as api_v1_router
 
 try:
     from fastapi import FastAPI, HTTPException
@@ -21,6 +22,8 @@ store = EvidenceStore(ARTIFACT_ROOT)
 engine = PatchPilot(ARTIFACT_ROOT)
 app = FastAPI(title="PatchPilot API", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.include_router(api_v1_router)
+install_api_v1(app)
 
 def _task_for(run_id: str):
     data = store.get_run(run_id)
@@ -80,7 +83,10 @@ def _decorate(run):
     runtime = (ended or time.time()) - started if started else 0
     repo_label = _repo_label(run.get("repo"), task)
     updated = ended or started
-    return {**run, "id": run["run_id"], "title": task.issue_title if task else run.get("task_id"), "issue_title": task.issue_title if task else None, "repo": repo_label, "commit": task.commit if task else None, "fixture": f"Fixture · {task.scenario}" if task else "local run", "runtime_sec": round(runtime, 3), "duration": f"{runtime:.1f}s", "retry_count": max(0, int(run.get("attempt", 1)) - 1), "confidence": 94 if run.get("conclusion") == "TRUSTED_DELIVERY" else 35, "updated_at": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(updated)) if updated else "", "event_count": len(events), "task": _task_payload(task)}
+    # Legacy consumers may still receive this projection, but confidence is
+    # intentionally absent unless a measured calibration record exists. A
+    # conclusion or process exit must never be turned into a made-up score.
+    return {**run, "id": run["run_id"], "title": task.issue_title if task else run.get("task_id"), "issue_title": task.issue_title if task else None, "repo": repo_label, "commit": task.commit if task else None, "fixture": f"Fixture · {task.scenario}" if task else "local run", "runtime_sec": round(runtime, 3), "duration": f"{runtime:.1f}s", "retry_count": max(0, int(run.get("attempt", 1)) - 1), "confidence": None, "confidence_basis": "not_recorded", "updated_at": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(updated)) if updated else "", "event_count": len(events), "task": _task_payload(task)}
 
 def _task_payload(task):
     """Review-safe subset of a TaskSpec (no host paths)."""

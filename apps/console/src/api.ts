@@ -12,7 +12,7 @@ export type TaskInfo = {
 export type RunRecord = {
   id: string; run_id: string; task_id: string; title: string; repo: string; commit: string | null;
   status: string; conclusion: Conclusion; attempt: number; runtime_sec: number; updated_at: string;
-  started_at?: number; event_count: number;
+  started_at?: number; event_count: number; confidence?: number | null; confidence_basis?: string;
   metrics?: { attempts?: number; reproduction_rate?: number; final_repair_rate?: number; recovery_success_rate?: number; evidence_completeness?: number };
   task: TaskInfo | null;
 };

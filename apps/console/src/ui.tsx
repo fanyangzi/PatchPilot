@@ -22,14 +22,14 @@ export function useAsync<T>(load: () => Promise<T>, deps: unknown[]) {
   return { ...state, reload };
 }
 
-/** URL routes: #/inspect, #/policy, #/overview, #/runs/<id>, #/routing/<id>, #/eval */
-export type Route = { page: 'overview' | 'runs' | 'routing' | 'eval' | 'inspect' | 'policy'; id?: string };
+/** URL routes: #/inbox, #/review/<task>, #/investigation/<task>, #/contract/<task>, #/report/<task>. Legacy run routes remain readable. */
+export type Route = { page: 'overview' | 'runs' | 'routing' | 'eval' | 'inspect' | 'policy' | 'inbox' | 'review' | 'investigation' | 'contract' | 'report'; id?: string };
 
 function parse(hash: string): Route {
   const [page, id] = hash.replace(/^#\/?/, '').split('/');
-  if (page === 'runs' || page === 'routing' || page === 'eval') return { page, id: id ? decodeURIComponent(id) : undefined };
+  if (page === 'runs' || page === 'routing' || page === 'eval' || page === 'inbox' || page === 'review' || page === 'investigation' || page === 'contract' || page === 'report') return { page, id: id ? decodeURIComponent(id) : undefined };
   if (page === 'inspect' || page === 'policy') return { page, id: id ? decodeURIComponent(id) : undefined };
-  return { page: 'overview' };
+  return { page: 'inbox' };
 }
 
 export function useRoute() {
