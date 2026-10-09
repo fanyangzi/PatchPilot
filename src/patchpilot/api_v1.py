@@ -322,6 +322,13 @@ class FindingReproduceCreate(APIModel):
         return value
 
 
+class FindingProbeCreate(FindingReproduceCreate):
+    """Execute one identical JSON probe on base and candidate workspaces."""
+
+    input: Any
+    repeats: int = Field(default=1, ge=1, le=1)
+
+
 class ProbePlanCreate(APIModel):
     """Request a bounded, deterministic counterexample probe plan."""
 
@@ -2052,6 +2059,81 @@ def shrink_finding(finding_id: str, body: FindingShrinkCreate, request: Request)
         "status": status,
         "trajectory": trajectory,
         "disclosure": "bounded oracle-preserving shrink; global minimality is not claimed; execute the minimized input on base/candidate to confirm a regression",
+    }, 202)
+
+
+@router.post("/findings/{finding_id}/probe", status_code=202)
+def probe_finding(finding_id: str, body: FindingProbeCreate, request: Request):
+    """Run one JSON input against the pinned base and candidate snapshots.
+
+    The command receives the exact canonical input in
+    ``PATCHPILOT_PROBE_INPUT_JSON``.  VerificationService executes the same
+    command and environment policy for both variants, then persists separate
+    immutable checks and findings.  This is the execution half of the F04
+    workflow; shrinking remains a separate, auditable operation.
+    """
+    store = _evidence_store()
+    finding = store.get_finding(finding_id)
+    if not finding:
+        raise APIError(404, "finding_not_found", "finding does not exist or is not visible")
+    source = store.get_verification(finding.verification_id)
+    candidate = store.get_candidate(finding.candidate_id)
+    contract = store.get_contract_version(finding.contract_id, finding.contract_revision)
+    if not source or not candidate or not contract:
+        raise APIError(409, "finding_snapshot_incomplete", "finding references unavailable immutable resources")
+    related_checks = {item.check_id: item for item in store.list_check_executions(finding.verification_id)}
+    source_checks = [related_checks[item] for item in finding.check_ids if item in related_checks]
+    command_argv = body.command_argv or [list(item.command_argv) for item in source_checks if item.command_argv] or [["pytest", "-q"]]
+    suite_id = body.suite_id or (source_checks[0].suite_id if source_checks else "probe-suite")
+    resources = _resources()
+    workspace = resources.acl_workspace("finding", finding_id) or _workspace_for_request(request)
+    created = utc_now()
+    job_id = f"job_{uuid.uuid4().hex}"
+    resources.jobs.create({
+        "job_id": job_id, "kind": "finding_probe", "state": "queued",
+        "resource_id": finding.verification_id, "created_at": created, "updated_at": created,
+        "finding_id": finding_id, "probe_input": body.input,
+    })
+    resources.bind_acl("job", job_id, workspace)
+    worker_id = f"api-probe:{uuid.uuid4().hex}"
+    leased = resources.jobs.claim(worker_id, job_id=job_id, lease_seconds=900)
+    if not leased:
+        raise APIError(409, "probe_job_unavailable", "probe job could not be claimed")
+    try:
+        result = VerificationService(store).execute(
+            finding.verification_id,
+            repo_id=body.repo_id,
+            repo_path=body.repo_path,
+            command_argv=command_argv,
+            suite_id=suite_id,
+            probe_input=body.input,
+            cancel_checker=lambda: resources.jobs.is_cancel_requested(job_id, worker_id, leased["lease_token"]),
+        )
+    except WorkspaceResolutionError as exc:
+        resources.jobs.complete(job_id, worker_id, leased["lease_token"], state="error", payload={"error": str(exc)})
+        raise APIError(422, "workspace_not_allowed", str(exc)) from exc
+    except VerificationExecutionError as exc:
+        resources.jobs.complete(job_id, worker_id, leased["lease_token"], state="error", payload={"error": str(exc)})
+        raise APIError(409, "probe_execution_error", str(exc)) from exc
+    except (ValueError, TypeError) as exc:
+        resources.jobs.complete(job_id, worker_id, leased["lease_token"], state="error", payload={"error": str(exc)})
+        raise APIError(422, "invalid_probe_request", str(exc)) from exc
+    execution_status = result.get("verification", {}).get("run_state", "completed")
+    queue_state = "completed" if execution_status == RunState.COMPLETED.value else "cancelled" if execution_status == RunState.CANCELLED.value else "error"
+    completed = resources.jobs.complete(job_id, worker_id, leased["lease_token"], state=queue_state, payload={
+        "result_verification_id": result.get("verification", {}).get("verification_id"),
+        "execution_status": execution_status,
+        "probe_input": body.input,
+    })
+    result_id = result.get("verification", {}).get("verification_id")
+    if result_id:
+        resources.bind_acl("verification", str(result_id), workspace)
+    for item in result.get("findings", []):
+        if item.get("finding_id"):
+            resources.bind_acl("finding", str(item["finding_id"]), workspace)
+    return _result(request, {
+        "status": execution_status, "job_id": job_id, "finding_id": finding_id,
+        "probe_input": body.input, "result": result, "job": completed,
     }, 202)
 
 

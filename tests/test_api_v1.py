@@ -604,6 +604,29 @@ def test_finding_shrink_persists_bounded_oracle_preserving_trajectory(api_client
     assert detail.json()["finding"]["probe_trajectories"][0]["trajectory_id"] == trajectory["trajectory_id"]
 
 
+def test_finding_probe_executes_same_input_on_base_and_candidate(api_client, tmp_path, monkeypatch):
+    client, _ = api_client
+    repo, _, task, _, _, finding = _create_candidate_failure_for_followup(client, tmp_path, monkeypatch)
+    script = (
+        "import os,sys; from calc import add; "
+        "print('1 passed' if add(1,2)==3 else '1 failed'); "
+        "sys.exit(0 if add(1,2)==3 else 1)"
+    )
+    response = client.post(f"/api/v1/findings/{finding['finding_id']}/probe", json={
+        "input": {"amount": 1}, "repo_path": str(repo),
+        "command_argv": [[sys.executable, "-c", script]], "suite_id": "probe-suite",
+    })
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "completed"
+    checks = body["result"]["checks"]
+    assert {item["variant"] for item in checks} == {"base", "candidate"}
+    outcomes = {item["variant"]: item["outcome"] for item in checks}
+    assert outcomes == {"base": "fail", "candidate": "pass"}
+    assert body["probe_input"] == {"amount": 1}
+    assert client.get(f"/api/v1/jobs/{body['job_id']}").json()["job"]["state"] == "completed"
+
+
 def test_repair_requires_explicit_approval_and_creates_child_candidate(api_client, tmp_path, monkeypatch):
     client, _ = api_client
     repo, base_sha, task, parent, _, finding = _create_candidate_failure_for_followup(client, tmp_path, monkeypatch)

@@ -369,6 +369,7 @@ class VerificationService:
         argv: tuple[str, ...],
         *,
         cancel_checker: Callable[[], bool] | None = None,
+        probe_input_json: str | None = None,
     ) -> CommandMeasurement:
         """Run one argv without a shell and observe cancellation while running.
 
@@ -392,9 +393,14 @@ class VerificationService:
         try:
             if cancel_checker and cancel_checker():
                 raise VerificationCancelled()
+            command_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+            if probe_input_json is not None:
+                # Both base and candidate receive the identical JSON through
+                # an explicit environment channel; argv remains shell-free.
+                command_env["PATCHPILOT_PROBE_INPUT_JSON"] = probe_input_json
             proc = subprocess.Popen(
                 list(argv), cwd=workspace, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                text=True, env=command_env,
                 start_new_session=(os.name != "nt"),
             )
             while True:
@@ -470,6 +476,7 @@ class VerificationService:
         command_argv: Sequence[Sequence[str]] | None = None,
         suite_id: str | None = None,
         cancel_checker: Callable[[], bool] | None = None,
+        probe_input: Any | None = None,
     ) -> dict[str, Any]:
         source = self.store.get_verification(verification_id)
         if source is None:
@@ -490,6 +497,12 @@ class VerificationService:
         run_state = RunState.COMPLETED
         verdict = Verdict.INCONCLUSIVE
         link_payload: dict[str, Any] = {"source_verification_id": verification_id, "commands": [list(item) for item in commands]}
+        if probe_input is not None:
+            link_payload["probe_input"] = probe_input
+
+        probe_json = None if probe_input is None else json.dumps(
+            probe_input, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
 
         def append_not_run(target: str, variant: str, argv: tuple[str, ...], reason: str) -> None:
             checks.append(CheckExecution(
@@ -519,7 +532,10 @@ class VerificationService:
                             append_not_run(target, variant, argv, "cancelled_before_check")
                             continue
                         try:
-                            measurement = self._measure(workspace, argv, cancel_checker=cancel_checker)
+                            measurement = self._measure(
+                                workspace, argv, cancel_checker=cancel_checker,
+                                probe_input_json=probe_json,
+                            )
                         except VerificationCancelled as exc:
                             cancelled = True
                             append_not_run(target, variant, argv, "cancelled_during_check")
