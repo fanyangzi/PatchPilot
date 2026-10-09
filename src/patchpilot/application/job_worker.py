@@ -62,6 +62,10 @@ class DurableJobStore:
                 "resource_id": "TEXT",
                 "lease_owner": "TEXT",
                 "lease_token": "INTEGER NOT NULL DEFAULT 0",
+                # ``fencing_token`` is the public/spec name.  Keep
+                # ``lease_token`` as a compatibility alias for existing
+                # callers and databases.
+                "fencing_token": "INTEGER NOT NULL DEFAULT 0",
                 "lease_until": "TEXT",
                 "heartbeat_at": "TEXT",
                 "attempt": "INTEGER NOT NULL DEFAULT 0",
@@ -71,9 +75,13 @@ class DurableJobStore:
             for name, definition in additions.items():
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE {self.table} ADD COLUMN {name} {definition}")
+            self.db.execute(
+                f"UPDATE {self.table} SET fencing_token=lease_token "
+                "WHERE fencing_token=0 AND lease_token<>0"
+            )
             # A separate event stream permits reconnect/replay without making
             # the mutable job row the source of truth for history.
-                cursor = self.db.execute(
+            self.db.execute(
                 "CREATE TABLE IF NOT EXISTS api_job_events("
                 "job_id TEXT NOT NULL, seq INTEGER NOT NULL, event_type TEXT NOT NULL,"
                 "payload TEXT NOT NULL, created_at TEXT NOT NULL,"
@@ -98,9 +106,12 @@ class DurableJobStore:
         # this makes GET /jobs useful after a restart without rewriting callers.
         for name in ("job_id", "kind", "state", "resource_id", "created_at", "updated_at",
                      "lease_owner", "lease_token", "lease_until", "heartbeat_at", "attempt",
-                     "cancel_requested", "event_seq"):
+                     "cancel_requested", "event_seq", "fencing_token"):
             if name in row.keys():
                 payload[name] = row[name]
+        # Databases created before the alias migration may not expose a
+        # non-zero fencing value; the lease token remains the source of truth.
+        payload["fencing_token"] = int(payload.get("fencing_token") or payload.get("lease_token") or 0)
         payload["cancel_requested"] = bool(payload.get("cancel_requested"))
         return payload
 
@@ -156,6 +167,7 @@ class DurableJobStore:
         data.setdefault("state", "queued")
         data.setdefault("lease_owner", None)
         data.setdefault("lease_token", 0)
+        data.setdefault("fencing_token", data["lease_token"])
         data.setdefault("lease_until", None)
         data.setdefault("heartbeat_at", None)
         data.setdefault("attempt", 0)
@@ -170,10 +182,10 @@ class DurableJobStore:
                 self.db.execute("BEGIN IMMEDIATE")
                 cursor = self.db.execute(
                     f"INSERT INTO {self.table}(job_id,kind,state,resource_id,payload,created_at,updated_at,"
-                    "lease_owner,lease_token,lease_until,heartbeat_at,attempt,cancel_requested,event_seq) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "lease_owner,lease_token,fencing_token,lease_until,heartbeat_at,attempt,cancel_requested,event_seq) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (data["job_id"], data["kind"], data["state"], data.get("resource_id"), encoded,
-                     data["created_at"], data["updated_at"], data["lease_owner"], data["lease_token"],
+                     data["created_at"], data["updated_at"], data["lease_owner"], data["lease_token"], data["fencing_token"],
                      data["lease_until"], data["heartbeat_at"], data["attempt"], int(bool(data["cancel_requested"])), data["event_seq"]),
                 )
                 self._append_event_unlocked(
@@ -223,15 +235,18 @@ class DurableJobStore:
                 token = int(row["lease_token"] or 0) + 1
                 attempt = int(row["attempt"] or 0) + 1
                 cursor = self.db.execute(
-                    f"UPDATE {self.table} SET state='running', lease_owner=?, lease_token=?, lease_until=?, "
+                    f"UPDATE {self.table} SET state='running', lease_owner=?, lease_token=?, fencing_token=?, lease_until=?, "
                     "heartbeat_at=?, attempt=?, updated_at=? WHERE job_id=? AND (state='queued' OR "
                     "(state='running' AND lease_until IS NOT NULL AND lease_until<=?))",
-                    (owner, token, until, now, attempt, now, row["job_id"], now),
+                    (owner, token, token, until, now, attempt, now, row["job_id"], now),
                 )
                 if cursor.rowcount != 1:
                     self.db.rollback()
                     return None
-                self._append_event_unlocked(row["job_id"], "claimed", {"worker_id": owner, "lease_token": token, "attempt": attempt, "lease_until": until})
+                self._append_event_unlocked(row["job_id"], "claimed", {
+                    "worker_id": owner, "lease_token": token, "fencing_token": token,
+                    "attempt": attempt, "lease_until": until,
+                })
                 self.db.commit()
                 return self.get(row["job_id"])
             except Exception:
@@ -249,7 +264,10 @@ class DurableJobStore:
             )
             ok = cursor.rowcount == 1
             if ok:
-                self._append_event_unlocked(job_id, "heartbeat", {"worker_id": worker_id, "lease_token": int(lease_token), "lease_until": until})
+                self._append_event_unlocked(job_id, "heartbeat", {
+                    "worker_id": worker_id, "lease_token": int(lease_token),
+                    "fencing_token": int(lease_token), "lease_until": until,
+                })
             self.db.commit()
             return ok
 
@@ -318,13 +336,16 @@ class DurableJobStore:
                 cursor = self.db.execute(
                     f"UPDATE {self.table} SET state=?,payload=?,lease_owner=NULL,lease_until=NULL,heartbeat_at=?,updated_at=? "
                     "WHERE job_id=? AND state='running' AND lease_owner=? AND lease_token=? AND lease_until>?",
-                    (final_state, self._json({k: v for k, v in existing.items() if k not in {"job_id", "kind", "state", "resource_id", "created_at", "updated_at", "lease_owner", "lease_token", "lease_until", "heartbeat_at", "attempt", "cancel_requested", "event_seq"}}), now, now, job_id, worker_id, int(lease_token), now),
+                    (final_state, self._json({k: v for k, v in existing.items() if k not in {"job_id", "kind", "state", "resource_id", "created_at", "updated_at", "lease_owner", "lease_token", "fencing_token", "lease_until", "heartbeat_at", "attempt", "cancel_requested", "event_seq"}}), now, now, job_id, worker_id, int(lease_token), now),
                 )
                 if cursor.rowcount != 1:
                     self.db.rollback()
                     raise LeaseLost(f"job {job_id} is fenced")
                 event_type = final_state if final_state != "cancelled" else "cancelled"
-                self._append_event_unlocked(job_id, event_type, {"worker_id": worker_id, "lease_token": int(lease_token), "cancel_requested": cancel_requested})
+                self._append_event_unlocked(job_id, event_type, {
+                    "worker_id": worker_id, "lease_token": int(lease_token),
+                    "fencing_token": int(lease_token), "cancel_requested": cancel_requested,
+                })
                 self.db.commit()
                 result = self.get(job_id)
                 if result is None:

@@ -22,6 +22,7 @@ def test_lease_token_fences_stale_worker_and_restart_requeues(tmp_path):
     queue.create(_job())
     first = queue.claim("worker-a", lease_seconds=1)
     assert first and first["state"] == "running" and first["lease_token"] == 1
+    assert first["fencing_token"] == 1
 
     # Simulate a crashed worker by moving its lease into the past.  Recovery
     # returns the job to queued and the next owner receives a higher fence.
@@ -31,12 +32,15 @@ def test_lease_token_fences_stale_worker_and_restart_requeues(tmp_path):
         queue.db.commit()
     assert queue.recover_expired() == 1
     second = queue.claim("worker-b", lease_seconds=30)
-    assert second and second["lease_token"] == 2 and second["attempt"] == 2
+    assert second and second["lease_token"] == 2 and second["fencing_token"] == 2 and second["attempt"] == 2
     with pytest.raises(LeaseLost):
         queue.complete("job-1", "worker-a", 1, state="completed")
     done = queue.complete("job-1", "worker-b", 2, state="completed", payload={"result": "measured"})
     assert done["state"] == "completed" and done["result"] == "measured"
-    assert [event["event"] for event in queue.events("job-1")] == ["queued", "claimed", "requeued", "claimed", "completed"]
+    events = queue.events("job-1")
+    assert events[1]["data"]["fencing_token"] == 1
+    assert events[3]["data"]["fencing_token"] == 2
+    assert [event["event"] for event in events] == ["queued", "claimed", "requeued", "claimed", "completed"]
 
 
 def test_cancel_is_durable_and_running_worker_confirms_cleanup(tmp_path):
