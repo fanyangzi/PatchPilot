@@ -23,12 +23,29 @@ export function useAsync<T>(load: () => Promise<T>, deps: unknown[]) {
 }
 
 /** URL routes: #/inbox, #/review/<task>, #/investigation/<task>, #/contract/<task>, #/report/<task>. Legacy run routes remain readable. */
-export type Route = { page: 'overview' | 'runs' | 'routing' | 'eval' | 'inspect' | 'policy' | 'inbox' | 'review' | 'investigation' | 'contract' | 'report'; id?: string };
+export type Route = {
+  page: 'overview' | 'runs' | 'routing' | 'eval' | 'inspect' | 'policy' | 'inbox' | 'review' | 'investigation' | 'contract' | 'report';
+  id?: string;
+  /** Review selections are part of the URL so a refresh cannot silently switch evidence. */
+  candidateId?: string;
+  contractId?: string;
+  checkId?: string;
+  reportId?: string;
+};
 
 function parse(hash: string): Route {
-  const [page, id] = hash.replace(/^#\/?/, '').split('/');
-  if (page === 'runs' || page === 'routing' || page === 'eval' || page === 'inbox' || page === 'review' || page === 'investigation' || page === 'contract' || page === 'report') return { page, id: id ? decodeURIComponent(id) : undefined };
-  if (page === 'inspect' || page === 'policy') return { page, id: id ? decodeURIComponent(id) : undefined };
+  const raw = hash.replace(/^#\/?/, '');
+  const [path, query = ''] = raw.split('?');
+  const [page, id] = path.split('/');
+  const params = new URLSearchParams(query);
+  const selection = {
+    candidateId: params.get('candidate') || undefined,
+    contractId: params.get('contract') || undefined,
+    checkId: params.get('check') || undefined,
+    reportId: params.get('report') || undefined,
+  };
+  if (page === 'runs' || page === 'routing' || page === 'eval' || page === 'inbox' || page === 'review' || page === 'investigation' || page === 'contract' || page === 'report') return { page, id: id ? decodeURIComponent(id) : undefined, ...selection };
+  if (page === 'inspect' || page === 'policy') return { page, id: id ? decodeURIComponent(id) : undefined, ...selection };
   return { page: 'inbox' };
 }
 
@@ -42,7 +59,15 @@ export function useRoute() {
   return route;
 }
 
-export const href = (r: Route) => `#/${r.page}${r.id ? `/${encodeURIComponent(r.id)}` : ''}`;
+export const href = (r: Route) => {
+  const params = new URLSearchParams();
+  if (r.candidateId) params.set('candidate', r.candidateId);
+  if (r.contractId) params.set('contract', r.contractId);
+  if (r.checkId) params.set('check', r.checkId);
+  if (r.reportId) params.set('report', r.reportId);
+  const query = params.toString();
+  return `#/${r.page}${r.id ? `/${encodeURIComponent(r.id)}` : ''}${query ? `?${query}` : ''}`;
+};
 export const go = (r: Route) => { location.hash = href(r); };
 
 /** A ruled section head. Every section in the console is introduced this way. */

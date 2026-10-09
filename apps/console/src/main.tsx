@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Activity, BookOpenCheck, ChartColumn, ClipboardCheck, FileText, GitPullRequest, Play, ScanSearch, Terminal } from 'lucide-react';
 import { api, type RunRecord } from './api';
+import { v1 } from './apiV1';
 import { useAsync, useRoute, href, go, Loading, Offline } from './ui';
 import { OverviewPage } from './pages/Overview';
 import { RunsPage } from './pages/Runs';
@@ -33,6 +34,7 @@ const TABS = [
 function App() {
   const route = useRoute();
   const runs = useAsync(() => api.runs(), []);
+  const service = useAsync(() => v1.health(), []);
   const [dialog, setDialog] = useState(false);
   const [intakeDialog, setIntakeDialog] = useState(false);
   const [freshRun, setFreshRun] = useState<string | null>(null);
@@ -44,7 +46,7 @@ function App() {
     go({ page: 'runs', id: run.id });
   };
 
-  const online = !runs.error;
+  const online = !service.error;
   return <div className="shell">
     <header className="topbar">
       <a className="brand" href={href({ page: 'inbox' })} aria-label="PatchPilot 验收队列">
@@ -61,7 +63,7 @@ function App() {
       </nav>
       <div className="topbar-end">
         <span className={`conn ${online ? 'conn-on' : 'conn-off'}`}>
-          <Activity size={14} />{runs.loading ? '连接中' : online ? '服务已连接' : '服务未连接'}
+          <Activity size={14} />{service.loading ? '连接中' : online ? '服务已连接' : '服务未连接'}
         </span>
         <button className="btn btn-primary" onClick={() => setIntakeDialog(true)} disabled={!online}><ClipboardCheck size={14} /> 导入验收任务</button>
       </div>
@@ -71,10 +73,10 @@ function App() {
       {route.page === 'inspect' && <InspectPage />}
       {route.page === 'policy' && <PolicyPage />}
       {route.page === 'inbox' && <AcceptanceInboxPage routeId={route.id} />}
-      {route.page === 'review' && <CodeReviewPage routeId={route.id} />}
-      {route.page === 'investigation' && <CounterexamplePage routeId={route.id} />}
-      {route.page === 'contract' && <AcceptanceContractPage routeId={route.id} />}
-      {route.page === 'report' && <DeliveryReportPage routeId={route.id} />}
+      {route.page === 'review' && <CodeReviewPage routeId={route.id} candidateId={route.candidateId} contractId={route.contractId} checkId={route.checkId} />}
+      {route.page === 'investigation' && <CounterexamplePage routeId={route.id} candidateId={route.candidateId} />}
+      {route.page === 'contract' && <AcceptanceContractPage routeId={route.id} contractId={route.contractId} />}
+      {route.page === 'report' && <DeliveryReportPage routeId={route.id} reportId={route.reportId} />}
       {route.page !== 'inspect' && route.page !== 'policy' && route.page !== 'inbox' && route.page !== 'review' && route.page !== 'investigation' && route.page !== 'contract' && route.page !== 'report' && (
         runs.loading && !runs.data ? <Loading label="正在连接 PatchPilot 服务" />
         : runs.error ? <Offline message={runs.error} onRetry={runs.reload} />

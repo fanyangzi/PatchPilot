@@ -56,6 +56,7 @@ export type Report = ReportMeta & { snapshot: { task: Task; candidate: Candidate
 
 const json = (value: unknown) => JSON.stringify(value);
 export const v1 = {
+  health: () => request<{ status: string; service: string; api_version: string; python?: string }>('/health'),
   inbox: () => request<{ items: InboxItem[]; total: number; request_id: string }>('/inbox'),
   tasks: () => request<{ items: Task[]; total: number; next_cursor?: string | null }>('/tasks?limit=500'),
   task: (id: string) => request<{ task: Task; candidates: Candidate[]; contracts: Contract[]; latest_verification: Verification | null }>(`/tasks/${enc(id)}`),
@@ -65,7 +66,7 @@ export const v1 = {
   verifications: (id: string) => request<{ verification: Verification; verification_key: string }>(`/verifications/${enc(id)}`),
   checks: (id: string) => request<{ items: Check[]; complete: boolean; required_gaps: string[] }>(`/verifications/${enc(id)}/checks`),
   executeVerification: (id: string, body: { repo_id?: string; repo_path?: string; suite_id?: string; command_argv?: string[][] }) => request<{ execution_id: string; source_verification_id: string; verification: Verification; checks: Check[]; status: string }>(`/verifications/${enc(id)}/execute`, { method: 'POST', body: json(body) }),
-  findings: (taskId: string) => request<{ items: Finding[]; available: boolean; complete: boolean; reason?: string }>(`/tasks/${enc(taskId)}/findings`),
+  findings: (taskId: string, candidateId?: string) => request<{ items: Finding[]; available: boolean; complete: boolean; reason?: string }>(`/tasks/${enc(taskId)}/findings${candidateId ? `?candidate_id=${enc(candidateId)}` : ''}`),
   reports: (taskId: string) => request<{ items: ReportMeta[] }>(`/tasks/${enc(taskId)}/reports`),
   report: (id: string) => request<{ report: Report }>(`/reports/${enc(id)}`),
   reportContent: (id: string) => request<{ report_id: string; format: string; content: string; content_sha: string }>(`/reports/${enc(id)}/content`),

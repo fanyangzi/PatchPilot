@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
-import { Activity, ArrowDownRight, ArrowRight, ArrowUpRight, BookOpenCheck, Check, CircleAlert, ClipboardCheck, FileSearch, FileText, GitBranch, GitCommitHorizontal, GitPullRequest, LoaderCircle, Plus, RefreshCw, ShieldAlert, ShieldCheck, SquareArrowOutUpRight, X } from 'lucide-react';
+import { Activity, ArrowDownRight, ArrowRight, ArrowUpRight, BookOpenCheck, Check, CircleAlert, ClipboardCheck, Download, FileSearch, FileText, GitBranch, GitCommitHorizontal, GitPullRequest, LoaderCircle, Plus, RefreshCw, ShieldAlert, ShieldCheck, SquareArrowOutUpRight, X } from 'lucide-react';
 import { V1Error, v1, type Candidate, type Check as CheckItem, type Condition, type Contract, type InboxItem, type Task, type Verification } from '../apiV1';
 import { go, href, type Route } from '../ui';
 
@@ -12,6 +12,10 @@ function useRemote<T>(key: string, load: () => Promise<T>): Remote<T> {
   const [version, setVersion] = useState(0);
   useEffect(() => {
     let current = true;
+    // Clear the previous resource immediately. Keeping an old diff/report visible
+    // while a new key is loading is a false success: candidate A must never look
+    // like candidate B after a deep-link or selector change.
+    setData(undefined);
     setLoading(true); setError(undefined);
     load().then((value) => { if (current) { setData(value); setLoading(false); } }, (e: unknown) => {
       if (current) { setError(e instanceof Error ? e.message : String(e)); setLoading(false); }
@@ -45,12 +49,23 @@ function RemoteState({ loading, error, empty, onRetry }: { loading: boolean; err
 function TaskSelect({ tasks, value, onChange }: { tasks: Task[]; value: string; onChange: (value: string) => void }) {
   return <label className="ac-select-label"><span>验收任务</span><select value={value} onChange={(e) => onChange(e.target.value)}><option value="">选择任务…</option>{tasks.map((task) => <option value={task.task_id} key={task.task_id}>{task.issue_snapshot.repo_id || '未知仓库'} · {task.issue_snapshot.title || task.task_id}</option>)}</select></label>;
 }
-function useSelectedTask(routeId?: string) {
+function useSelectedTask(routeId?: string, page?: Route['page']) {
   const tasks = useTasks();
-  const [selected, setSelected] = useState(routeId || '');
-  useEffect(() => { if (routeId) setSelected(routeId); else if (!selected && tasks.data?.length) setSelected(tasks.data[0].task_id); }, [routeId, tasks.data, selected]);
-  const task = useTask(selected || undefined);
-  return { tasks, selected, setSelected, task };
+  const [selected, setSelectedState] = useState(routeId || '');
+  // Route changes are authoritative and must preserve the candidate/contract
+  // query parameters owned by the caller. Only an explicit user selection
+  // should rewrite the hash.
+  useEffect(() => { if (routeId) setSelectedState(routeId); else if (!selected && tasks.data?.length) setSelected(tasks.data[0].task_id); }, [routeId, tasks.data, selected]);
+  // Prefer the route parameter during the render in which it changes. This
+  // prevents one frame of the previous task from leaking into a deep-linked
+  // review page before the synchronization effect runs.
+  const active = routeId || selected;
+  const task = useTask(active || undefined);
+  const setSelected = (value: string) => {
+    setSelectedState(value);
+    if (page && value) go({ page, id: value });
+  };
+  return { tasks, selected: active, setSelected, task };
 }
 function RouteLink({ route, children }: { route: Route; children: React.ReactNode }) {
   return <a className="ac-link" href={href(route)}>{children}<ArrowRight size={14} /></a>;
@@ -119,21 +134,37 @@ export function IntakeDialog({ onClose, onCreated }: { onClose: () => void; onCr
   </form></div>;
 }
 
-export function CodeReviewPage({ routeId }: { routeId?: string }) {
-  const { tasks, selected, setSelected, task } = useSelectedTask(routeId);
-  const [candidateId, setCandidateId] = useState('');
+export function CodeReviewPage({ routeId, candidateId: routeCandidateId, contractId: routeContractId, checkId: routeCheckId }: { routeId?: string; candidateId?: string; contractId?: string; checkId?: string }) {
+  const { tasks, selected, setSelected, task } = useSelectedTask(routeId, 'review');
+  const [candidateId, setCandidateIdState] = useState(routeCandidateId || '');
   const [suite, setSuite] = useState(''); const [environment, setEnvironment] = useState(''); const [policy, setPolicy] = useState('');
   const [baselineHash, setBaselineHash] = useState('unavailable'); const [commandsJson, setCommandsJson] = useState('');
   const [repoId, setRepoId] = useState(''); const [repoPath, setRepoPath] = useState('');
   const [decision, setDecision] = useState<'accepted' | 'rejected' | 'exception_accepted'>('accepted'); const [decisionReason, setDecisionReason] = useState('');
   const [busy, setBusy] = useState(''); const [actionError, setActionError] = useState(''); const [toast, setToast] = useState('');
   const current = task.data?.task; const candidates = task.data?.candidates || [];
-  useEffect(() => { if (candidates.length && !candidates.some((c) => c.candidate_id === candidateId)) setCandidateId(candidates[0].candidate_id); if (!candidates.length) setCandidateId(''); }, [candidates, candidateId]);
+  const setCandidateId = (value: string) => {
+    setCandidateIdState(value);
+    if (selected && value) go({ page: 'review', id: selected, candidateId: value, contractId: routeContractId, checkId: routeCheckId });
+  };
+  useEffect(() => {
+    if (routeCandidateId && candidates.some((c) => c.candidate_id === routeCandidateId)) setCandidateIdState(routeCandidateId);
+    else if (candidates.length && !candidates.some((c) => c.candidate_id === candidateId)) setCandidateId(candidates[0].candidate_id);
+    if (!candidates.length) setCandidateIdState('');
+  }, [candidates, candidateId, routeCandidateId]);
   const candidate = candidates.find((c) => c.candidate_id === candidateId);
   const diff = useRemote(candidateId, () => candidateId ? v1.candidateDiff(candidateId) : Promise.reject(new Error('该任务没有候选补丁')));
   const verification = task.data?.latest_verification?.candidate_id === candidateId ? task.data.latest_verification : null;
   const contracts = task.data?.contracts || [];
-  const frozen = [...contracts].reverse().find((c) => c.state === 'frozen');
+  const frozen = contracts.find((c) => c.contract_id === routeContractId && c.state === 'frozen') || [...contracts].reverse().find((c) => c.state === 'frozen');
+  const checks = useRemote(`review-checks:${verification?.verification_id || 'none'}`, () => verification
+    ? v1.checks(verification.verification_id)
+    : Promise.resolve({ items: [] as CheckItem[], complete: false, required_gaps: [] as string[] }));
+  useEffect(() => {
+    if (routeCheckId && checks.data?.items.some((item) => item.check_id === routeCheckId)) {
+      document.getElementById(`review-check-${routeCheckId}`)?.scrollIntoView({ block: 'center' });
+    }
+  }, [routeCheckId, checks.data]);
   const act = async (label: string, fn: () => Promise<unknown>) => { setBusy(label); setActionError(''); setToast(''); try { await fn(); setToast(label); task.reload(); } catch (e) { setActionError(unwrapError(e)); } finally { setBusy(''); } };
   const run = () => act('验证记录已创建', async () => {
     let argv: string[][];
@@ -161,23 +192,27 @@ export function CodeReviewPage({ routeId }: { routeId?: string }) {
       <RemoteState loading={task.loading} error={task.error} onRetry={task.reload} />
       {current && <>
         <div className="ac-source-banner"><div><span className="ac-label">问题来源</span><h2>{taskTitle(current)}</h2><p>{current.issue_snapshot.repo_id} <span>·</span> 基线 <code>{current.issue_snapshot.base_ref || '未解析'}</code></p></div><SourceRefs refs={current.source_refs} /></div>
-        <div className="ac-review-grid"><section className="ac-sheet ac-diff-sheet"><div className="ac-section-title"><div><GitBranch size={16} /><h2>候选补丁差异</h2></div><select aria-label="切换候选补丁" value={candidateId} onChange={(e) => setCandidateId(e.target.value)}><option value="">选择候选</option>{candidates.map((c) => <option key={c.candidate_id} value={c.candidate_id}>{c.candidate_id.slice(0, 25)} · {c.author_type}</option>)}</select></div>
+        <div className="ac-review-grid"><section className="ac-sheet ac-diff-sheet"><div className="ac-section-title"><div><GitBranch size={16} /><h2>候选补丁差异</h2></div><label className="ac-inline-control"><span className="sr-only">切换候选补丁</span><select aria-label="切换候选补丁" value={candidateId} onChange={(e) => setCandidateId(e.target.value)}><option value="">选择候选</option>{candidates.map((c) => <option key={c.candidate_id} value={c.candidate_id}>{c.candidate_id.slice(0, 25)} · {c.author_type}</option>)}</select></label></div>
           {!candidates.length ? <div className="ac-state ac-state-empty">此任务暂无候选补丁记录。</div> : <><div className="ac-candidate-meta"><span>候选 <code>{candidate?.candidate_id}</code></span><span>基线 <code>{candidate?.base_sha}</code></span><span>内容 SHA256 <code>{candidate?.patch_hash}</code></span></div><RemoteState loading={diff.loading} error={diff.error} empty={!diff.loading && !diff.error && !diff.data?.available ? `补丁内容未提供给 API（${diff.data?.content_ref || '无可读取的 content ref'}）；仅显示服务端保存的摘要。` : undefined} onRetry={diff.reload} />{diff.data?.available && diff.data.content && <pre className="ac-code"><code>{diff.data.content}</code></pre>}</>}
         </section>
         <aside className="ac-sheet ac-review-aside"><div className="ac-section-title"><div><ShieldCheck size={16} /><h2>验收依据</h2></div></div>
           {frozen ? <><div className="ac-contract-head"><strong>冻结合同 v{frozen.revision}</strong><code>{frozen.contract_hash}</code></div><ul className="ac-condition-list">{frozen.conditions.map((c) => <li key={c.condition_id}><span>{c.kind} · {c.required ? '必须' : '可选'}</span><p>{c.statement}</p><SourceRefs refs={c.source_refs} /></li>)}</ul></> : <div className="ac-state ac-state-empty">尚无冻结合同。验收标准确定并冻结后，才能创建验证记录。</div>}
           <div className="ac-verdict-area"><div className="ac-section-title"><div><Activity size={16} /><h2>验证状态</h2></div></div>{fourStatus(verification)}{verification && <><p className="ac-key-line">verification_key <code>{verification.verification_key}</code></p>{verification.gaps.length > 0 && <div className="ac-gap"><CircleAlert size={14} />未覆盖：{verification.gaps.join('、')}</div>}<div className="ac-decision-form"><label>维护者决定<select value={decision} onChange={(e) => setDecision(e.target.value as typeof decision)}><option value="accepted">accepted · 在范围内接受</option><option value="rejected">rejected · 拒绝</option><option value="exception_accepted">exception_accepted · 例外接受</option></select></label><label>决定理由<textarea rows={2} value={decisionReason} onChange={(e) => setDecisionReason(e.target.value)} placeholder="记录可追溯的维护者理由" /></label><div className="ac-form-actions">{actionError && <span className="ac-action-error"><CircleAlert size={14} />{actionError}</span>}{toast && <span className="ac-action-ok"><Check size={14} />{toast}</span>}<button className="btn" onClick={recordDecision} disabled={!!busy || !verification.verification_key.trim()}><ShieldCheck size={14} />记录维护者决定</button></div></div></>}</div>
-        </aside></div>
+        </aside>
+        <section className="ac-sheet ac-review-matrix" aria-labelledby="review-matrix-title"><div className="ac-section-title"><div><ClipboardCheck size={16} /><h2 id="review-matrix-title">验证矩阵</h2></div><span>仅显示服务端持久化检查</span></div>
+          {!verification && <div className="ac-state ac-state-empty">当前候选尚未建立验证记录，不能推断测试通过。</div>}
+          {verification && <><RemoteState loading={checks.loading} error={checks.error} empty={!checks.loading && !checks.error && checks.data?.items.length === 0 ? '验证已创建但尚无逐项执行记录；queued / not_evaluated 保持原样。' : undefined} onRetry={checks.reload} />{checks.data?.items.length ? <div className="ac-table-wrap"><table className="ac-table"><thead><tr><th>检查</th><th>变体</th><th>结果</th><th>测试数</th><th>执行</th></tr></thead><tbody>{checks.data.items.map((item) => <tr id={`review-check-${item.check_id}`} key={item.check_id}><td><strong>{item.target}</strong><span className="ac-cell-sub">{item.suite_id}</span></td><td><code>{item.variant}</code></td><td><Status label="结果" value={item.outcome || 'unknown'} tone={stateTone(item.outcome)} /></td><td>{item.count}</td><td><RouteLink route={{ page: 'investigation', id: selected, candidateId, checkId: item.check_id }}>查看证据</RouteLink></td></tr>)}</tbody></table></div> : null}</>}
+        </section></div>
         <section className="ac-sheet ac-run-form"><div className="ac-section-title"><div><GitCommitHorizontal size={16} /><h2>创建验证记录</h2></div><span>需要当前冻结合同和所选候选</span></div><p className="ac-note">提交后创建一条新的不可变验证记录。当前服务若没有执行 worker，状态仍会保持 queued / not_evaluated，不会显示为通过。</p><div className="ac-form-grid"><label>验证套件 ID<input value={suite} onChange={(e) => setSuite(e.target.value)} placeholder="例：repo-tests-v1" /></label><label>环境 ID<input value={environment} onChange={(e) => setEnvironment(e.target.value)} placeholder="固定镜像或环境摘要" /></label><label>策略 ID<input value={policy} onChange={(e) => setPolicy(e.target.value)} placeholder="实际启用的策略版本" /></label><label>基线测试哈希<input value={baselineHash} onChange={(e) => setBaselineHash(e.target.value)} placeholder="未知时保留 unavailable" /></label><label>仓库映射（owner/name）<input value={repoId} onChange={(e) => setRepoId(e.target.value)} placeholder="使用 PATCHPILOT_REPO_MAP 时填写" /></label><label className="ac-form-wide">本地工作区路径（可选）<input value={repoPath} onChange={(e) => setRepoPath(e.target.value)} placeholder="必须在 PATCHPILOT_WORKSPACE_ROOTS 内" /></label><label className="ac-form-wide">执行命令（argv JSON）<textarea value={commandsJson} onChange={(e) => setCommandsJson(e.target.value)} placeholder={'[["pytest", "-q"]]'} rows={2} /></label></div><div className="ac-form-actions">{actionError && <span className="ac-action-error"><CircleAlert size={14} />{actionError}</span>}{toast && <span className="ac-action-ok"><Check size={14} />{toast}</span>}<button className="btn btn-primary" disabled={!candidate || !frozen || !suite.trim() || !environment.trim() || !policy.trim() || !commandsJson.trim() || !!busy} onClick={run}>{busy ? <LoaderCircle size={14} className="spin" /> : <Activity size={14} />}创建验证记录</button>{verification && <button className="btn" disabled={!!busy || (!repoId.trim() && !repoPath.trim())} onClick={execute}>{busy === '验证执行已记录' ? <LoaderCircle size={14} className="spin" /> : <GitCommitHorizontal size={14} />}执行受控本地验收</button>}</div>
-        <div className="ac-page-links"><RouteLink route={{ page: 'contract', id: selected }}>查看验收条件</RouteLink><RouteLink route={{ page: 'investigation', id: selected }}>调查反例与检查</RouteLink><RouteLink route={{ page: 'report', id: selected }}>查看交付报告</RouteLink></div></section>
+        <div className="ac-page-links"><RouteLink route={{ page: 'contract', id: selected, contractId: frozen?.contract_id }}>查看验收条件</RouteLink><RouteLink route={{ page: 'investigation', id: selected, candidateId }}>调查反例与检查</RouteLink><RouteLink route={{ page: 'report', id: selected }}>查看交付报告</RouteLink></div></section>
       </>}
     </>}
   </div>;
 }
 
-function ContractEditor({ task, onSaved }: { task: Task; onSaved: () => void }) {
+function ContractEditor({ task, onSaved, initialContractId }: { task: Task; onSaved: () => void; initialContractId?: string }) {
   const contracts = useRemote(task.task_id, () => v1.contracts(task.task_id));
-  const [contractId, setContractId] = useState(''); const [conditions, setConditions] = useState<Condition[]>([]);
+  const [contractId, setContractId] = useState(initialContractId || ''); const [conditions, setConditions] = useState<Condition[]>([]);
   const [baseSnapshot, setBaseSnapshot] = useState(task.issue_snapshot.base_ref || '');
   const [sourceIds, setSourceIds] = useState(task.source_refs.join('\n'));
   const [exclusions, setExclusions] = useState(''); const [busy, setBusy] = useState(''); const [error, setError] = useState(''); const [notice, setNotice] = useState('');
@@ -207,7 +242,7 @@ function ContractEditor({ task, onSaved }: { task: Task; onSaved: () => void }) 
     await v1.freezeContract(contract.contract_id, { expected_revision: contract.revision, confirmed_condition_ids: conditions.map((c) => c.condition_id), scope_exclusions: exclusions.split('\n').map((x) => x.trim()).filter(Boolean), actor: 'maintainer' });
   });
   const changeCondition = (index: number, changes: Partial<Condition>) => setConditions((prev) => prev.map((c, i) => i === index ? { ...c, ...changes } : c));
-  return <div className="ac-contract-layout"><aside className="ac-sheet ac-contract-sidebar"><div className="ac-section-title"><div><BookOpenCheck size={16} /><h2>合同版本</h2></div><button className="icon-btn" title="刷新合同" onClick={contracts.reload}><RefreshCw size={14} /></button></div><RemoteState loading={contracts.loading} error={contracts.error} empty={!contracts.loading && !contracts.error && !items.length ? '当前任务还没有验收合同。' : undefined} onRetry={contracts.reload} />{items.map((item) => <button key={`${item.contract_id}-${item.revision}`} className={`ac-contract-version ${item.contract_id === activeId ? 'selected' : ''}`} onClick={() => { setContractId(item.contract_id); setConditions(item.conditions); }}><span>v{item.revision} · {item.state}</span><small>{item.contract_id}</small></button>)}<button className="btn" onClick={() => { setContractId(''); setConditions([]); createDraft(); }} disabled={!!busy}><Plus size={14} />建立新草稿</button></aside>
+  return <div className="ac-contract-layout"><aside className="ac-sheet ac-contract-sidebar"><div className="ac-section-title"><div><BookOpenCheck size={16} /><h2>合同版本</h2></div><button className="icon-btn" title="刷新合同" onClick={contracts.reload}><RefreshCw size={14} /></button></div><RemoteState loading={contracts.loading} error={contracts.error} empty={!contracts.loading && !contracts.error && !items.length ? '当前任务还没有验收合同。' : undefined} onRetry={contracts.reload} />{items.map((item) => <button key={`${item.contract_id}-${item.revision}`} className={`ac-contract-version ${item.contract_id === activeId ? 'selected' : ''}`} onClick={() => { setContractId(item.contract_id); setConditions(item.conditions); go({ page: 'contract', id: task.task_id, contractId: item.contract_id }); }}><span>v{item.revision} · {item.state}</span><small>{item.contract_id}</small></button>)}<button className="btn" onClick={() => { setContractId(''); setConditions([]); go({ page: 'contract', id: task.task_id }); createDraft(); }} disabled={!!busy}><Plus size={14} />建立新草稿</button></aside>
     <section className="ac-sheet ac-contract-main"><div className="ac-section-title"><div><BookOpenCheck size={16} /><h2>{contract ? `合同 ${contract.contract_id} · v${contract.revision}` : '新建合同草稿'}</h2></div>{contract && <span className={`ac-state-pill ${contract.state}`}>{contract.state}</span>}</div>
       <div className="ac-origin-grid"><label>基线快照 / Git 引用<input value={baseSnapshot} onChange={(e) => setBaseSnapshot(e.target.value)} disabled={!!contract} placeholder="来自实际任务的 commit 或已解析快照 ID" /></label><label>合同来源（每行一条 URL 或可追溯 ID）<textarea value={sourceIds} onChange={(e) => setSourceIds(e.target.value)} disabled={!!contract} rows={3} placeholder="Issue、PR、需求文档等实际来源" /></label></div>
       {!contract && <div className="ac-contract-empty"><p>合同草稿会以这些来源记录为依据；创建之后可补充逐条验收条件。</p><button className="btn btn-primary" onClick={createDraft} disabled={!!busy || !sourceIds.trim() || !baseSnapshot.trim()}>{busy ? <LoaderCircle size={14} className="spin" /> : <Plus size={14} />}建立合同草稿</button></div>}
@@ -217,22 +252,29 @@ function ContractEditor({ task, onSaved }: { task: Task; onSaved: () => void }) 
       </div>{editable && <div className="ac-freeze-block"><label>范围排除项（每行一条）<textarea value={exclusions} onChange={(e) => setExclusions(e.target.value)} rows={2} placeholder="明确本次验收不覆盖的内容" /></label><div className="ac-form-actions">{error && <span className="ac-action-error"><CircleAlert size={14} />{error}</span>}{notice && <span className="ac-action-ok"><Check size={14} />{notice}</span>}<button className="btn" onClick={save} disabled={!!busy || !conditions.length}><Check size={14} />保存新版本</button><button className="btn btn-primary" onClick={freeze} disabled={!!busy || !conditions.length}><ShieldCheck size={14} />冻结验收条件</button></div><p className="ac-note">冻结后合同版本不可修改。调整标准需要创建新版本，历史验证将保留其原合同绑定。</p></div>}{!editable && <div className="ac-frozen-banner"><ShieldCheck size={16} />该合同已冻结。页面展示的是服务器记录的不可变版本。</div>}</>}
     </section></div>;
 }
-export function AcceptanceContractPage({ routeId }: { routeId?: string }) {
-  const { tasks, selected, setSelected, task } = useSelectedTask(routeId);
+export function AcceptanceContractPage({ routeId, contractId: routeContractId }: { routeId?: string; contractId?: string }) {
+  const { tasks, selected, setSelected, task } = useSelectedTask(routeId, 'contract');
   return <div className="ac-page"><PageHead eyebrow="ACCEPTANCE CONTRACT / 04" title="验收条件" lead="来源化维护验收标准，保存不可变版本并显式冻结；修复流程不能改写这些条件。" icon={BookOpenCheck} />
     <div className="ac-toolbar"><RemoteState loading={tasks.loading} error={tasks.error} onRetry={tasks.reload} />{!tasks.loading && !tasks.error && tasks.data?.length ? <TaskSelect tasks={tasks.data} value={selected} onChange={setSelected} /> : null}</div>
-    {selected && <><RemoteState loading={task.loading} error={task.error} onRetry={task.reload} />{task.data && <><div className="ac-contract-task"><span className="ac-label">任务来源</span><strong>{taskTitle(task.data.task)}</strong><SourceRefs refs={task.data.task.source_refs} /></div><ContractEditor task={task.data.task} onSaved={task.reload} /></>}</>}
+    {selected && <><RemoteState loading={task.loading} error={task.error} onRetry={task.reload} />{task.data && <><div className="ac-contract-task"><span className="ac-label">任务来源</span><strong>{taskTitle(task.data.task)}</strong><SourceRefs refs={task.data.task.source_refs} /></div><ContractEditor task={task.data.task} initialContractId={routeContractId} onSaved={task.reload} /></>}</>}
     {!tasks.loading && !tasks.error && !tasks.data?.length && <RemoteState loading={false} empty="当前没有可编辑验收合同的真实任务。" onRetry={tasks.reload} />}
   </div>;
 }
 
-export function CounterexamplePage({ routeId }: { routeId?: string }) {
-  const { tasks, selected, setSelected, task } = useSelectedTask(routeId);
+export function CounterexamplePage({ routeId, candidateId: routeCandidateId }: { routeId?: string; candidateId?: string }) {
+  const { tasks, selected, setSelected, task } = useSelectedTask(routeId, 'investigation');
+  const [candidateId, setCandidateId] = useState(routeCandidateId || '');
+  const candidates = task.data?.candidates || [];
+  useEffect(() => {
+    if (routeCandidateId && candidates.some((candidate) => candidate.candidate_id === routeCandidateId)) setCandidateId(routeCandidateId);
+    else if (candidates.length && !candidates.some((candidate) => candidate.candidate_id === candidateId)) setCandidateId(candidates[0].candidate_id);
+    else if (!candidates.length) setCandidateId('');
+  }, [routeCandidateId, candidates, candidateId]);
   const verification = task.data?.latest_verification;
   const checks = useRemote(verification?.verification_id || 'no-verification', () => verification ? v1.checks(verification.verification_id) : Promise.reject(new Error('当前任务没有验证记录')));
-  const findings = useRemote(selected || 'no-findings-task', () => selected ? v1.findings(selected) : Promise.reject(new Error('请选择一个任务')));
+  const findings = useRemote(`${selected || 'no-findings-task'}:${candidateId}`, () => selected ? v1.findings(selected, candidateId || undefined) : Promise.reject(new Error('请选择一个任务')));
   return <div className="ac-page"><PageHead eyebrow="COUNTEREXAMPLE INVESTIGATION / 03" title="反例调查" lead="沿着候选、合同、检查结果和证据来源检查失败或未知项；只有可验证证据才能形成判断。" icon={FileSearch} />
-    <div className="ac-toolbar"><RemoteState loading={tasks.loading} error={tasks.error} onRetry={tasks.reload} />{!tasks.loading && !tasks.error && tasks.data?.length ? <TaskSelect tasks={tasks.data} value={selected} onChange={setSelected} /> : null}</div>
+    <div className="ac-toolbar"><RemoteState loading={tasks.loading} error={tasks.error} onRetry={tasks.reload} />{!tasks.loading && !tasks.error && tasks.data?.length ? <><TaskSelect tasks={tasks.data} value={selected} onChange={(value) => { setSelected(value); setCandidateId(''); }} />{candidates.length > 1 && <label className="ac-select-label"><span>候选</span><select value={candidateId} aria-label="切换调查候选" onChange={(event) => { const value = event.target.value; setCandidateId(value); if (selected && value) go({ page: 'investigation', id: selected, candidateId: value }); }}><option value="">全部候选</option>{candidates.map((candidate) => <option key={candidate.candidate_id} value={candidate.candidate_id}>{candidate.candidate_id.slice(0, 25)} · {candidate.author_type}</option>)}</select></label>}</> : null}</div>
     {selected && <><RemoteState loading={task.loading} error={task.error} onRetry={task.reload} />{task.data && <><div className="ac-investigation-summary"><div><span className="ac-label">当前任务</span><strong>{taskTitle(task.data.task)}</strong><p>{task.data.task.issue_snapshot.repo_id} · {task.data.task.task_id}</p></div><div>{verification ? <>{fourStatus(verification)}<code className="ac-key-line">{verification.verification_key}</code></> : <Status label="验证记录" value="不存在" />}</div></div>
       {!verification ? <div className="ac-sheet ac-info-sheet"><CircleAlert size={18} /><div><strong>没有可调查的验证记录</strong><p>该任务当前没有服务端验证记录，不能推断其通过或失败。请先在代码审查页选择候选并创建验证任务。</p><RouteLink route={{ page: 'review', id: selected }}>前往代码审查</RouteLink></div></div> : <><div className="ac-sheet ac-gap-sheet"><h2><FileSearch size={16} />反例资源</h2><RemoteState loading={findings.loading} error={findings.error} empty={!findings.loading && !findings.error && !findings.data?.available ? (findings.data?.reason || '反例执行资源暂不可用。') : findings.data?.items.length === 0 ? '暂无反例记录；这不构成“没有反例”或通过证明。' : undefined} onRetry={findings.reload} />{findings.data?.available && findings.data.items.length > 0 && <div className="ac-table-wrap"><table className="ac-table"><thead><tr><th>反例</th><th>状态</th><th>说明</th><th>证据</th></tr></thead><tbody>{findings.data.items.map((finding, i) => <tr key={finding.finding_id || i}><td><strong>{finding.title || finding.kind || finding.finding_id || `反例 ${i + 1}`}</strong></td><td><Status label="状态" value={finding.status || 'unknown'} tone={stateTone(finding.status)} /></td><td>{finding.message || '—'}</td><td><SourceRefs refs={finding.evidence_refs || []} /></td></tr>)}</tbody></table></div>}</div><RemoteState loading={checks.loading} error={checks.error} empty={!checks.loading && !checks.error && checks.data?.items.length === 0 ? `服务端目前没有持久化的逐项检查结果。${checks.data?.required_gaps.length ? ` 未完成项：${checks.data.required_gaps.join('、')}` : ''}` : undefined} onRetry={checks.reload} />{checks.data?.items.length ? <div className="ac-table-wrap"><table className="ac-table"><thead><tr><th>检查</th><th>结果</th><th>命令</th><th>退出码</th><th>证据引用</th></tr></thead><tbody>{checks.data.items.map((check, i) => <tr key={check.check_id || i}><td><strong>{check.variant} · {check.target}</strong><span className="ac-cell-sub">{check.suite_id} · {check.count} cases</span></td><td><Status label="结果" value={check.outcome || 'unknown'} tone={stateTone(check.outcome)} /></td><td><code>{check.command_argv?.join(' ') || '—'}</code></td><td>{check.return_code ?? '—'}</td><td><code>{check.details?.reason ? String(check.details.reason) : (check.duration_ms != null ? `${check.duration_ms} ms` : '—')}</code></td></tr>)}</tbody></table></div> : null}<section className="ac-sheet ac-gap-sheet"><h2><ShieldAlert size={16} />未完成与环境缺口</h2>{checks.data?.required_gaps.length ? <ul>{checks.data.required_gaps.map((gap) => <li key={gap}>{gap}</li>)}</ul> : <p>API 未报告 required_gaps；这不代表有通过证据，仍需以完整检查记录和验证结论为准。</p>}</section></>}
       </>}</>}
@@ -240,15 +282,29 @@ export function CounterexamplePage({ routeId }: { routeId?: string }) {
   </div>;
 }
 
-export function DeliveryReportPage({ routeId }: { routeId?: string }) {
-  const { tasks, selected, setSelected, task } = useSelectedTask(routeId);
+export function DeliveryReportPage({ routeId, reportId: routeReportId }: { routeId?: string; reportId?: string }) {
+  const { tasks, selected, setSelected, task } = useSelectedTask(routeId, 'report');
   const verification = task.data?.latest_verification;
   const checks = useRemote(verification?.verification_id || 'no-verification-report', () => verification ? v1.checks(verification.verification_id) : Promise.reject(new Error('当前任务没有验证记录')));
   const reports = useRemote(selected || 'no-reports-task', () => selected ? v1.reports(selected) : Promise.reject(new Error('请选择一个任务')));
-  const [reportId, setReportId] = useState(''); const [busy, setBusy] = useState(''); const [actionError, setActionError] = useState('');
+  const [reportId, setReportIdState] = useState(routeReportId || ''); const [busy, setBusy] = useState(''); const [actionError, setActionError] = useState('');
+  const setReportId = (value: string) => { setReportIdState(value); if (selected && value) go({ page: 'report', id: selected, reportId: value }); };
   const report = useRemote(reportId || 'no-report', () => reportId ? v1.report(reportId) : Promise.reject(new Error('请选择一份报告')));
   const content = useRemote(reportId || 'no-report-content', () => reportId ? v1.reportContent(reportId) : Promise.reject(new Error('请选择一份报告')));
-  useEffect(() => { if (reports.data?.items.length && !reports.data.items.some((item) => item.report_id === reportId)) setReportId(reports.data.items[0].report_id); }, [reports.data, reportId]);
+  useEffect(() => {
+    if (routeReportId && reports.data?.items.some((item) => item.report_id === routeReportId)) setReportIdState(routeReportId);
+    else if (reports.data?.items.length && !reports.data.items.some((item) => item.report_id === reportId)) setReportId(reports.data.items[0].report_id);
+  }, [reports.data, reportId, routeReportId]);
+  const downloadReport = () => {
+    if (!content.data?.content || !report.data?.report) return;
+    const blob = new Blob([content.data.content], { type: report.data.report.format === 'html' ? 'text/html;charset=utf-8' : 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `patchpilot-${report.data.report.report_id}.${report.data.report.format === 'html' ? 'html' : 'md'}`;
+    document.body.appendChild(link); link.click(); link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
   const create = async (format: 'markdown' | 'html') => {
     if (!verification) return; setBusy(format); setActionError('');
     try { const result = await v1.createReport(verification.verification_id, format); setReportId(result.report.report_id); reports.reload(); } catch (e) { setActionError(unwrapError(e)); } finally { setBusy(''); }
@@ -258,7 +314,7 @@ export function DeliveryReportPage({ routeId }: { routeId?: string }) {
     {selected && <><RemoteState loading={task.loading} error={task.error} onRetry={task.reload} />{task.data && <>{verification ? <>
       <div className="ac-report-actions"><div><span className="ac-label">当前验证</span><code>{verification.verification_id}</code><span className="ac-muted"> · key {verification.verification_key}</span></div><div>{actionError && <span className="ac-action-error"><CircleAlert size={14} />{actionError}</span>}<button className="btn" onClick={() => create('markdown')} disabled={!!busy}>{busy === 'markdown' ? <LoaderCircle size={14} className="spin" /> : <FileText size={14} />}生成 Markdown 报告</button><button className="btn" onClick={() => create('html')} disabled={!!busy}>{busy === 'html' ? <LoaderCircle size={14} className="spin" /> : <SquareArrowOutUpRight size={14} />}生成 HTML 报告</button></div></div>
       <RemoteState loading={reports.loading} error={reports.error} empty={!reports.loading && !reports.error && reports.data?.items.length === 0 ? '该验证尚未生成交付报告。只有通过真实报告 API 创建后才会显示。' : undefined} onRetry={reports.reload} />
-      {!!reports.data?.items.length && <div className="ac-report-layout"><aside className="ac-sheet ac-report-list"><h2>已生成报告</h2>{reports.data.items.map((item) => <button className={`ac-report-item ${item.report_id === reportId ? 'selected' : ''}`} key={item.report_id} onClick={() => setReportId(item.report_id)}><strong>{item.format.toUpperCase()}</strong><span>{item.report_id}</span><small>{item.created_at}</small></button>)}</aside>{reportId && <article className="ac-report"><RemoteState loading={report.loading} error={report.error} onRetry={report.reload} />{report.data?.report && <><header><div><span className="ac-eyebrow"><FileText size={13} />VERIFICATION-BOUND RECORD</span><h2>{taskTitle(report.data.report.snapshot.task)}</h2><p>{report.data.report.snapshot.task.issue_snapshot.repo_id} · {report.data.report.report_id}</p></div><Status label="报告格式" value={report.data.report.format} /></header><div className="ac-report-band"><div><span>报告绑定状态</span><div className="ac-four"><Status label="验证" value={report.data.report.verification_id} /><Status label="key" value={report.data.report.verification_key.slice(0, 16) + '…'} /><Status label="内容" value={report.data.report.content_sha.slice(0, 16) + '…'} /></div></div></div><section><h3>报告快照范围</h3><dl className="ac-report-facts"><div><dt>候选</dt><dd><code>{report.data.report.snapshot.verification.candidate_id}</code></dd></div><div><dt>验收合同</dt><dd><code>{report.data.report.snapshot.verification.contract_id}</code> · revision {report.data.report.snapshot.verification.contract_revision}</dd></div><div><dt>范围说明</dt><dd>{report.data.report.snapshot.scope_statement || '服务端未提供额外范围说明'}</dd></div></dl></section><section><h3>报告正文</h3><RemoteState loading={content.loading} error={content.error} onRetry={content.reload} />{content.data && <pre className="ac-code ac-report-content">{content.data.content}</pre>}</section><footer><span>创建于 {report.data.report.created_at}</span><span>content SHA256 <code>{report.data.report.content_sha}</code></span></footer></>}</article>}</div>}
+      {!!reports.data?.items.length && <div className="ac-report-layout"><aside className="ac-sheet ac-report-list"><h2>已生成报告</h2>{reports.data.items.map((item) => <button className={`ac-report-item ${item.report_id === reportId ? 'selected' : ''}`} key={item.report_id} onClick={() => setReportId(item.report_id)}><strong>{item.format.toUpperCase()}</strong><span>{item.report_id}</span><small>{item.created_at}</small></button>)}</aside>{reportId && <article className="ac-report"><RemoteState loading={report.loading} error={report.error} onRetry={report.reload} />{report.data?.report && <><header><div><span className="ac-eyebrow"><FileText size={13} />VERIFICATION-BOUND RECORD</span><h2>{taskTitle(report.data.report.snapshot.task)}</h2><p>{report.data.report.snapshot.task.issue_snapshot.repo_id} · {report.data.report.report_id}</p></div><div className="ac-report-header-actions"><Status label="报告格式" value={report.data.report.format} /><button className="btn" onClick={downloadReport} disabled={!content.data?.content} aria-label="下载当前报告"><Download size={14} />下载报告</button></div></header><div className="ac-report-band"><div><span>报告绑定状态</span><div className="ac-four"><Status label="验证" value={report.data.report.verification_id} /><Status label="key" value={report.data.report.verification_key.slice(0, 16) + '…'} /><Status label="内容" value={report.data.report.content_sha.slice(0, 16) + '…'} /></div></div></div><section><h3>报告快照范围</h3><dl className="ac-report-facts"><div><dt>候选</dt><dd><code>{report.data.report.snapshot.verification.candidate_id}</code></dd></div><div><dt>验收合同</dt><dd><code>{report.data.report.snapshot.verification.contract_id}</code> · revision {report.data.report.snapshot.verification.contract_revision}</dd></div><div><dt>范围说明</dt><dd>{report.data.report.snapshot.scope_statement || '服务端未提供额外范围说明'}</dd></div></dl></section><section><h3>报告正文</h3><RemoteState loading={content.loading} error={content.error} onRetry={content.reload} />{content.data && <pre className="ac-code ac-report-content">{content.data.content}</pre>}</section><footer><span>创建于 {report.data.report.created_at}</span><span>content SHA256 <code>{report.data.report.content_sha}</code></span></footer></>}</article>}</div>}
     </> : <div className="ac-sheet ac-info-sheet"><FileText size={18} /><div><strong>当前任务没有可引用的验证记录</strong><p>此页面不会用静态演示内容生成报告。需要先建立来源清楚的验收合同和候选验证，报告才能绑定真实执行证据。</p><RouteLink route={{ page: 'review', id: selected }}>前往代码审查并创建验证记录</RouteLink></div></div>}</>}</>}
     {!tasks.loading && !tasks.error && !tasks.data?.length && <RemoteState loading={false} empty="暂无可生成交付报告的真实任务。" onRetry={tasks.reload} />}
   </div>;
