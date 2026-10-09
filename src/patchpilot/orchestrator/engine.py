@@ -377,9 +377,11 @@ class PatchPilot:
                         break
             # A disposable worktree can live below the caller's checkout.
             # Pin pytest's root to that worktree so a parent pytest.ini cannot
-            # redirect collection to the control repository.
+            # redirect collection to the control repository.  Use a relative
+            # path because Docker sees the checkout as /workspace, not the
+            # host's absolute path.
             if not any(p == '--rootdir' or p.startswith('--rootdir=') for p in parts):
-                parts.extend(['--rootdir', task.repo])
+                parts.extend(['--rootdir', '.'])
             if '--tb=no' not in ' '.join(parts):
                 parts.append('--tb=no')
             return h.run(parts)

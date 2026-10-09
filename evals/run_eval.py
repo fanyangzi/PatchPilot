@@ -110,7 +110,7 @@ def apply_candidate_patch(workspace: Path, task: TaskSpec, attempt: int) -> None
 def run_tests(workspace: Path, task: TaskSpec) -> dict[str, Any]:
     command = str(task.constraints.get("test_command", "python3 -m pytest -q")).split()
     if "pytest" in command and not any(item == "--rootdir" or item.startswith("--rootdir=") for item in command):
-        command.extend(["--rootdir", str(workspace)])
+        command.extend(["--rootdir", "."])
     result = Harness(
         str(workspace),
         timeout=int(task.risk_policy.get("max_runtime_sec", 30)),
