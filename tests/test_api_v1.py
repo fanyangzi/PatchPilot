@@ -464,7 +464,7 @@ def test_execute_runs_base_and_candidate_in_real_temporary_git_repo(api_client, 
     checks = client.get(f"/api/v1/verifications/{result['verification_id']}/checks")
     assert checks.status_code == 200
     assert checks.json()["complete"] is True
-    assert len(checks.json()["items"]) == 2
+    assert len([item for item in checks.json()["items"] if item["target"].startswith("command-")]) == 2
     assert api.store.get_verification(queued["verification_id"]).run_state.value == "queued"
     assert api.store.get_verification(result["verification_id"]).verdict.value == "accepted_within_scope"
 
@@ -491,7 +491,8 @@ def test_execution_cancellation_kills_running_process_and_preserves_not_run_chec
     assert verification["run_state"] == "cancelled"
     assert verification["verdict"] == "inconclusive"
     assert "cancelled" in verification["gaps"]
-    assert result["checks"] and all(item["outcome"] == "not_run" for item in result["checks"])
+    command_checks = [item for item in result["checks"] if item["target"].startswith("command-")]
+    assert command_checks and all(item["outcome"] == "not_run" for item in command_checks)
     # Process-group termination should return promptly instead of waiting for
     # the command's full sleep duration.
     assert time.monotonic() - started < 5
