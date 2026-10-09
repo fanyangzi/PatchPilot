@@ -41,11 +41,13 @@ RESULT_FIELDS = [
 
 def load_tasks() -> list[TaskSpec]:
     tasks = []
+    loader = PatchPilot(ROOT / "artifacts" / ".eval-loader")
     for path in sorted((ROOT / "fixtures" / "tasks").glob("*.yaml")):
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        repo = Path(str(data["repo"]))
-        data["repo"] = str((ROOT / repo).resolve() if not repo.is_absolute() else repo)
-        tasks.append(TaskSpec.from_dict(data))
+        # Use the production manifest loader so patch_files/test_patch_file are
+        # materialized into TaskSpec.patches and TaskSpec.test_patch.  The
+        # previous YAML-only path silently dropped candidate diffs, causing
+        # patchpilot_full to report "no candidate patch" for every fixture.
+        tasks.append(loader.load_task(path))
     if not tasks:
         raise RuntimeError("no fixed task manifests found")
     return tasks
@@ -53,12 +55,12 @@ def load_tasks() -> list[TaskSpec]:
 
 def load_real_tasks() -> list[TaskSpec]:
     tasks = []
+    loader = PatchPilot(ROOT / "artifacts" / ".eval-loader-real")
     real_dir = ROOT / "fixtures" / "tasks" / "real"
     if not real_dir.exists():
         return tasks
     for path in sorted(real_dir.glob("*.yaml")):
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        tasks.append(TaskSpec.from_dict(data))
+        tasks.append(loader.load_task(path))
     return tasks
 
 
@@ -106,6 +108,8 @@ def apply_candidate_patch(workspace: Path, task: TaskSpec, attempt: int) -> None
 
 def run_tests(workspace: Path, task: TaskSpec) -> dict[str, Any]:
     command = str(task.constraints.get("test_command", "python3 -m pytest -q")).split()
+    if "pytest" in command and not any(item == "--rootdir" or item.startswith("--rootdir=") for item in command):
+        command.extend(["--rootdir", str(workspace)])
     result = Harness(
         str(workspace),
         timeout=int(task.risk_policy.get("max_runtime_sec", 30)),

@@ -375,6 +375,11 @@ class PatchPilot:
                     if 'pytest' in p:
                         parts.insert(i + 1, '-v')
                         break
+            # A disposable worktree can live below the caller's checkout.
+            # Pin pytest's root to that worktree so a parent pytest.ini cannot
+            # redirect collection to the control repository.
+            if not any(p == '--rootdir' or p.startswith('--rootdir=') for p in parts):
+                parts.extend(['--rootdir', task.repo])
             if '--tb=no' not in ' '.join(parts):
                 parts.append('--tb=no')
             return h.run(parts)
