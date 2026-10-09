@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "patchpilot"
 version = "0.1.0"
 description = "Policy-constrained AI maintenance runtime for open-source repositories"
-readme = "README.md"
+readme = "HANDOFF.md"
 requires-python = ">=3.11"
 dependencies = ["PyYAML>=6.0"]
 
