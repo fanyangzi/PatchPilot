@@ -48,6 +48,34 @@ class ProbeClassification:
     details: Mapping[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class ShrinkStep:
+    """One durable delta-debugging decision.
+
+    A shrink is evidence only when every accepted step preserves the same
+    failure predicate.  Keeping both accepted and rejected candidates makes
+    the result auditable after a worker restart instead of exposing only the
+    final value.
+    """
+
+    step: int
+    input: Any
+    input_hash: str
+    failed: bool
+    decision: str
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "step": self.step,
+            "input": self.input,
+            "input_hash": self.input_hash,
+            "failed": self.failed,
+            "decision": self.decision,
+            **({"error": self.error} if self.error else {}),
+        }
+
+
 def _stable_hash(value: Any) -> str:
     import hashlib
     import json
@@ -171,6 +199,90 @@ def minimize_failure(value: Any, fails: Callable[[Any], bool], *, max_steps: int
     return current
 
 
+def shrink_failure_with_trace(
+    value: Any,
+    fails: Callable[[Any], bool],
+    *,
+    max_steps: int = 32,
+) -> tuple[Any, list[ShrinkStep]]:
+    """Shrink a failing input and return the complete bounded decision trace.
+
+    ``minimize_failure`` predates persisted probe evidence and intentionally
+    returns only a value.  This companion keeps the same conservative
+    semantics while recording every predicate call, including errors.  It is
+    useful to persist a reviewable trajectory without claiming global
+    minimality: the trace is capped and the final value is simply the smallest
+    value found within that budget.
+    """
+
+    if max_steps < 1:
+        raise ValueError("max_steps must be positive")
+    trace: list[ShrinkStep] = []
+
+    def evaluate(candidate: Any, step: int, decision: str) -> bool:
+        try:
+            failed = bool(fails(candidate))
+            trace.append(ShrinkStep(step, candidate, _stable_hash(candidate), failed, decision))
+            return failed
+        except Exception as exc:  # a broken oracle is never a preserved failure
+            trace.append(ShrinkStep(step, candidate, _stable_hash(candidate), False, "error", str(exc)[:500]))
+            return False
+
+    if not evaluate(value, 0, "seed"):
+        return value, trace
+    current = value
+    steps = 0
+
+    def candidates(item: Any) -> Iterable[Any]:
+        if isinstance(item, str):
+            if item:
+                yield ""
+                yield item[: len(item) // 2]
+                yield item[1:]
+        elif isinstance(item, (list, tuple)):
+            seq = list(item)
+            yield type(item)()
+            for index in range(len(seq)):
+                yield type(item)(seq[:index] + seq[index + 1 :])
+            if len(seq) > 1:
+                yield type(item)(seq[: len(seq) // 2])
+        elif isinstance(item, Mapping):
+            mapping = dict(item)
+            yield {}
+            for key in list(mapping):
+                reduced = dict(mapping)
+                reduced.pop(key, None)
+                yield reduced
+            for key in mapping:
+                if mapping[key] is not None:
+                    reduced = dict(mapping)
+                    reduced[key] = None
+                    yield reduced
+        elif isinstance(item, (int, float)) and not isinstance(item, bool):
+            yield 0
+            yield item // 2 if isinstance(item, int) else item / 2
+
+    changed = True
+    while changed and steps < max_steps:
+        changed = False
+        for candidate in candidates(current):
+            steps += 1
+            if evaluate(candidate, steps, "candidate"):
+                # Rewrite the last decision without re-running the oracle.
+                last = trace[-1]
+                trace[-1] = ShrinkStep(last.step, last.input, last.input_hash, True, "accepted")
+                current = candidate
+                changed = True
+                break
+            else:
+                last = trace[-1]
+                if last.decision == "candidate":
+                    trace[-1] = ShrinkStep(last.step, last.input, last.input_hash, last.failed, "rejected", last.error)
+            if steps >= max_steps:
+                break
+    return current, trace
+
+
 def classify_observations(observations: Sequence[ProbeObservation], *, oracle_valid: bool = True) -> ProbeClassification:
     """Classify repeated base/candidate observations fail-closed.
 
@@ -199,4 +311,4 @@ def classify_observations(observations: Sequence[ProbeObservation], *, oracle_va
     return ProbeClassification("no_counterexample", "inconclusive", "当前有界输入未观察到反例。", True, len(observations), item.input_hash)
 
 
-__all__ = ["ProbeCase", "ProbeObservation", "ProbeClassification", "generate_boundary_inputs", "minimize_failure", "classify_observations"]
+__all__ = ["ProbeCase", "ProbeObservation", "ProbeClassification", "ShrinkStep", "generate_boundary_inputs", "minimize_failure", "shrink_failure_with_trace", "classify_observations"]

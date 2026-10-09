@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+import multiprocessing
+import os
+import time
 
 import pytest
 
@@ -78,3 +81,36 @@ def test_event_cursor_replay_is_ordered(tmp_path):
     replay = queue.events("job-1", after=1)
     assert [item["seq"] for item in replay] == [2, 3]
     assert replay[0]["data"] == {"phase": "prepare"}
+
+
+def _crash_after_claim(db_root: str) -> None:
+    """Crash a real worker process after it has durably claimed a job."""
+    store = EvidenceStore(db_root)
+    queue = DurableJobStore(store.db, store._lock, table="jobs")
+    assert queue.claim("worker-crashed", lease_seconds=1)
+    os._exit(0)
+
+
+def test_real_worker_process_restart_reclaims_expired_lease(tmp_path):
+    """A fresh process recovers a crashed worker and publishes once."""
+    root = str(tmp_path)
+    store = EvidenceStore(root)
+    queue = DurableJobStore(store.db, store._lock, table="jobs")
+    queue.create(_job("job-process-restart"))
+
+    first = multiprocessing.Process(target=_crash_after_claim, args=(root,))
+    first.start()
+    first.join(timeout=5)
+    assert first.exitcode == 0
+    # The lease is intentionally short; this is the persisted crash window.
+    time.sleep(1.15)
+
+    restarted_store = EvidenceStore(root)
+    restarted_queue = DurableJobStore(restarted_store.db, restarted_store._lock, table="jobs")
+    worker = DurableJobWorker(restarted_queue, "worker-restarted", lease_seconds=30)
+    result = worker.run_once(lambda job: {"result": "recovered"})
+    assert result and result["state"] == "completed" and result["result"] == "recovered"
+    assert result["attempt"] == 2 and result["fencing_token"] == 2
+    assert [event["event"] for event in restarted_queue.events("job-process-restart")] == [
+        "queued", "claimed", "requeued", "claimed", "completed"
+    ]

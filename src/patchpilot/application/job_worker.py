@@ -414,5 +414,40 @@ class DurableJobWorker:
             except LeaseLost:
                 raise
 
+    def run_forever(
+        self,
+        handler: Callable[[dict[str, Any]], Mapping[str, Any] | None],
+        *,
+        stop_event: threading.Event | None = None,
+        poll_seconds: float = 0.25,
+        max_jobs: int | None = None,
+    ) -> int:
+        """Run a restart-safe worker loop over the durable queue.
+
+        The loop intentionally has no in-memory success state: every job is
+        reclaimed from SQLite with a fencing token and every terminal result
+        is written before the next poll.  A new process can therefore call the
+        same method on the same artifact database after a crash; expired
+        leases are requeued before claiming work.  ``max_jobs`` is useful for
+        one-shot worker processes and deterministic clean-room checks.
+        """
+        if poll_seconds < 0:
+            raise ValueError("poll_seconds cannot be negative")
+        completed = 0
+        stopper = stop_event or threading.Event()
+        while not stopper.is_set() and (max_jobs is None or completed < max_jobs):
+            try:
+                result = self.run_once(handler)
+            except LeaseLost:
+                # Another worker fenced this lease; the next poll will pick
+                # up the queue state rather than converting a stale write into
+                # a duplicate terminal publication.
+                result = None
+            if result is not None:
+                completed += 1
+                continue
+            stopper.wait(poll_seconds)
+        return completed
+
 
 __all__ = ["DurableJobStore", "DurableJobWorker", "LeaseLost", "TERMINAL_STATES"]

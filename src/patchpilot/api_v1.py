@@ -63,7 +63,7 @@ from .application.job_worker import DurableJobStore
 from .domain.entities import CheckExecution
 from .verifier.diff import parse_unified_diff
 from .integrations.github_source import GitHubSourceResolver, SourceResolutionError
-from .verification.probes import generate_boundary_inputs
+from .verification.probes import generate_boundary_inputs, shrink_failure_with_trace
 
 
 router = APIRouter(prefix="/api/v1", tags=["v1"])
@@ -333,6 +333,31 @@ class ProbePlanCreate(APIModel):
     @classmethod
     def validate_oracle_id(cls, value: str | None) -> str | None:
         return _valid_id(value, "oracle_id") if value is not None else None
+
+
+class FindingShrinkCreate(APIModel):
+    """Request a bounded, persisted shrink of one measured counterexample.
+
+    The oracle is a structured predicate supplied by the maintainer.  Python
+    expressions and arbitrary code are intentionally rejected; this keeps a
+    shrink reproducible and safe to replay after a worker restart.
+    """
+
+    input: Any
+    oracle: dict[str, Any]
+    max_steps: int = Field(default=32, ge=1, le=128)
+
+    @field_validator("oracle")
+    @classmethod
+    def validate_oracle(cls, value: dict[str, Any]) -> dict[str, Any]:
+        kind = value.get("type")
+        if kind not in {"contains", "not_contains", "equals", "json_field_equals"}:
+            raise ValueError("oracle.type must be contains, not_contains, equals or json_field_equals")
+        if kind in {"contains", "not_contains"} and not isinstance(value.get("value"), str):
+            raise ValueError("contains oracle requires a string value")
+        if kind == "json_field_equals" and not isinstance(value.get("field"), str):
+            raise ValueError("json_field_equals oracle requires a field")
+        return value
 
 
 class RepairCreate(APIModel):
@@ -1951,7 +1976,83 @@ def get_finding(finding_id: str, request: Request):
     finding = _evidence_store().get_finding(finding_id)
     if not finding:
         raise APIError(404, "finding_not_found", "finding does not exist or is not visible")
-    return _result(request, {"finding": finding.to_dict()})
+    store = _evidence_store()
+    payload = finding.to_dict()
+    payload["probe_trajectories"] = store.list_probe_trajectories(finding_id)
+    return _result(request, {"finding": payload})
+
+
+@router.get("/findings/{finding_id}/trajectories")
+def list_finding_trajectories(finding_id: str, request: Request):
+    """List immutable shrink attempts attached to a finding."""
+    store = _evidence_store()
+    if not store.get_finding(finding_id):
+        raise APIError(404, "finding_not_found", "finding does not exist or is not visible")
+    return _result(request, {"finding_id": finding_id, "items": store.list_probe_trajectories(finding_id)})
+
+
+def _structured_probe_oracle(value: Any, oracle: Mapping[str, Any]) -> bool:
+    """Evaluate the small, JSON-only oracle vocabulary used by shrink API."""
+    kind = oracle.get("type")
+    if kind == "contains":
+        return str(oracle.get("value")) in str(value)
+    if kind == "not_contains":
+        return str(oracle.get("value")) not in str(value)
+    if kind == "equals":
+        return value == oracle.get("value")
+    if kind == "json_field_equals":
+        if not isinstance(value, Mapping):
+            return False
+        return value.get(str(oracle.get("field"))) == oracle.get("value")
+    return False
+
+
+@router.post("/findings/{finding_id}/shrink", status_code=202)
+def shrink_finding(finding_id: str, body: FindingShrinkCreate, request: Request):
+    """Persist a bounded, oracle-preserving counterexample shrink trajectory.
+
+    The endpoint records the raw input, every predicate decision, the final
+    bounded minimum and the oracle definition.  It never calls a dynamic
+    expression and never claims global minimality.  A maintainer can use the
+    trajectory as an input to a subsequent base/candidate reproduction run.
+    """
+    store = _evidence_store()
+    finding = store.get_finding(finding_id)
+    if not finding:
+        raise APIError(404, "finding_not_found", "finding does not exist or is not visible")
+    predicate = lambda candidate: _structured_probe_oracle(candidate, body.oracle)
+    try:
+        minimized, trace = shrink_failure_with_trace(body.input, predicate, max_steps=body.max_steps)
+    except ValueError as exc:
+        raise APIError(422, "invalid_shrink_request", str(exc)) from exc
+    preserved = bool(trace and trace[0].failed and _structured_probe_oracle(minimized, body.oracle))
+    status = "minimized" if preserved else "inconclusive"
+    trajectory = {
+        "trajectory_id": f"trajectory_{uuid.uuid4().hex}",
+        "finding_id": finding.finding_id,
+        "verification_id": finding.verification_id,
+        "task_id": finding.task_id,
+        "status": status,
+        "oracle": body.oracle,
+        "raw_input": body.input,
+        "raw_input_hash": trace[0].input_hash if trace else None,
+        "minimized_input": minimized,
+        "minimized_input_hash": next((item.input_hash for item in reversed(trace) if item.input == minimized), None),
+        "failure_preserved": preserved,
+        "global_minimum": False,
+        "max_steps": body.max_steps,
+        "steps": [item.to_dict() for item in trace],
+        "created_at": utc_now(),
+    }
+    store.save_probe_trajectory(trajectory)
+    workspace = _resources().acl_workspace("finding", finding_id) or _workspace_for_request(request)
+    resources = _resources()
+    resources.bind_acl("probe_trajectory", trajectory["trajectory_id"], workspace)
+    return _result(request, {
+        "status": status,
+        "trajectory": trajectory,
+        "disclosure": "bounded oracle-preserving shrink; global minimality is not claimed; execute the minimized input on base/candidate to confirm a regression",
+    }, 202)
 
 
 @router.post("/findings/{finding_id}/reproduce", status_code=202)

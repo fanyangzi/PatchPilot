@@ -99,6 +99,21 @@ class EvidenceStore:
                 BEFORE UPDATE ON findings BEGIN SELECT RAISE(ABORT, 'immutable finding'); END;
             CREATE TRIGGER IF NOT EXISTS immutable_findings_delete
                 BEFORE DELETE ON findings BEGIN SELECT RAISE(ABORT, 'immutable finding'); END;
+            CREATE TABLE IF NOT EXISTS probe_trajectories(
+                trajectory_id TEXT PRIMARY KEY,
+                finding_id TEXT NOT NULL REFERENCES findings(finding_id),
+                verification_id TEXT NOT NULL REFERENCES verifications(verification_id),
+                task_id TEXT NOT NULL REFERENCES tasks(task_id),
+                status TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_probe_trajectories_finding
+                ON probe_trajectories(finding_id, created_at, trajectory_id);
+            CREATE TRIGGER IF NOT EXISTS immutable_probe_trajectories_update
+                BEFORE UPDATE ON probe_trajectories BEGIN SELECT RAISE(ABORT, 'immutable probe trajectory'); END;
+            CREATE TRIGGER IF NOT EXISTS immutable_probe_trajectories_delete
+                BEFORE DELETE ON probe_trajectories BEGIN SELECT RAISE(ABORT, 'immutable probe trajectory'); END;
             CREATE TABLE IF NOT EXISTS jobs(
                 job_id TEXT PRIMARY KEY, kind TEXT NOT NULL, state TEXT NOT NULL,
                 payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -391,6 +406,46 @@ class EvidenceStore:
         with self._lock:
             rows = self.db.execute(query, params).fetchall()
         return [Finding(**json.loads(row["payload"])) for row in rows]
+
+    def save_probe_trajectory(self, trajectory: Mapping[str, Any]) -> None:
+        """Append one immutable counterexample shrink trajectory.
+
+        A trajectory is deliberately stored separately from a finding.  A
+        finding remains the measured observation while one or more bounded
+        shrink attempts can be attached later, preserving retries and oracle
+        changes without rewriting the original evidence.
+        """
+        required = ("trajectory_id", "finding_id", "verification_id", "task_id", "status", "created_at")
+        if any(not trajectory.get(name) for name in required):
+            raise ValueError("trajectory_id, finding_id, verification_id, task_id, status and created_at are required")
+        payload = self._json(dict(trajectory))
+        with self._lock:
+            finding = self.db.execute(
+                "SELECT finding_id,verification_id,task_id FROM findings WHERE finding_id=?",
+                (trajectory["finding_id"],),
+            ).fetchone()
+            if not finding:
+                raise ValueError("trajectory references unavailable finding")
+            if finding["verification_id"] != trajectory["verification_id"] or finding["task_id"] != trajectory["task_id"]:
+                raise ValueError("trajectory resources do not match finding")
+            self.db.execute(
+                "INSERT INTO probe_trajectories(trajectory_id,finding_id,verification_id,task_id,status,payload,created_at) VALUES (?,?,?,?,?,?,?)",
+                (trajectory["trajectory_id"], trajectory["finding_id"], trajectory["verification_id"], trajectory["task_id"], trajectory["status"], payload, trajectory["created_at"]),
+            )
+            self.db.commit()
+
+    def get_probe_trajectory(self, trajectory_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.db.execute("SELECT payload FROM probe_trajectories WHERE trajectory_id=?", (trajectory_id,)).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def list_probe_trajectories(self, finding_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT payload FROM probe_trajectories WHERE finding_id=? ORDER BY created_at,trajectory_id",
+                (finding_id,),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
 
     @staticmethod
     def _finding_id(verification_id: str, marker: str) -> str:

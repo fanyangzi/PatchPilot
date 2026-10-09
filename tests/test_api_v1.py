@@ -580,6 +580,30 @@ def test_finding_reproduction_repeats_same_contract_and_marks_flaky(api_client, 
     assert client.get(f"/api/v1/tasks/{task['task_id']}/findings").status_code == 200
 
 
+def test_finding_shrink_persists_bounded_oracle_preserving_trajectory(api_client, tmp_path, monkeypatch):
+    client, _ = api_client
+    _, _, _, _, _, finding = _create_candidate_failure_for_followup(client, tmp_path, monkeypatch)
+    response = client.post(f"/api/v1/findings/{finding['finding_id']}/shrink", json={
+        "input": "prefix:bad:suffix",
+        "oracle": {"type": "contains", "value": "bad"},
+        "max_steps": 32,
+    })
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "minimized"
+    trajectory = body["trajectory"]
+    assert trajectory["failure_preserved"] is True
+    assert trajectory["global_minimum"] is False
+    assert trajectory["minimized_input"] == "bad"
+    assert trajectory["steps"] and trajectory["steps"][0]["decision"] == "seed"
+    listed = client.get(f"/api/v1/findings/{finding['finding_id']}/trajectories")
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["trajectory_id"] == trajectory["trajectory_id"]
+    detail = client.get(f"/api/v1/findings/{finding['finding_id']}")
+    assert detail.status_code == 200
+    assert detail.json()["finding"]["probe_trajectories"][0]["trajectory_id"] == trajectory["trajectory_id"]
+
+
 def test_repair_requires_explicit_approval_and_creates_child_candidate(api_client, tmp_path, monkeypatch):
     client, _ = api_client
     repo, base_sha, task, parent, _, finding = _create_candidate_failure_for_followup(client, tmp_path, monkeypatch)
