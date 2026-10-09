@@ -503,6 +503,7 @@ class VerificationService:
         probe_json = None if probe_input is None else json.dumps(
             probe_input, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
         )
+        probe_hash = _sha256_bytes(probe_json.encode("utf-8")) if probe_json is not None else None
 
         def append_not_run(target: str, variant: str, argv: tuple[str, ...], reason: str) -> None:
             checks.append(CheckExecution(
@@ -543,13 +544,19 @@ class VerificationService:
                             # represented explicitly; completed checks remain
                             # untouched in the immutable result.
                             continue
+                        measurement_details = dict(measurement.details)
+                        if probe_hash:
+                            measurement_details.update({
+                                "probe_input_hash": probe_hash,
+                                "probe_input_channel": "PATCHPILOT_PROBE_INPUT_JSON",
+                            })
                         checks.append(CheckExecution(
                             check_id=f"check_{uuid.uuid4().hex}", verification_id=result_id,
                             suite_id=suite, target=target, variant=variant,
                             outcome=measurement.outcome, count=measurement.count,
                             command_argv=measurement.argv, return_code=measurement.return_code,
                             duration_ms=measurement.duration_ms, stdout=measurement.stdout,
-                            stderr=measurement.stderr, details=measurement.details,
+                            stderr=measurement.stderr, details=measurement_details,
                         ))
                     if cancelled:
                         for remaining_index in range(index + 1, len(commands) + 1):
