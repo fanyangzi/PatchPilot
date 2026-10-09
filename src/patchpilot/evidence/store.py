@@ -723,6 +723,51 @@ class EvidenceStore:
             rows=self.db.execute("SELECT payload FROM artifacts WHERE run_id=?",(run_id,)).fetchall()
             return [json.loads(row["payload"]) for row in rows]
 
+    def check_artifacts(self, run_id: str) -> dict[str, Any]:
+        """Verify every recorded artifact for one run without mutating state.
+
+        The check is intentionally independent from the database digest: it
+        resolves each registered path under the artifact root, rejects
+        symlink components, and recomputes both byte length and SHA-256.  A
+        corrupt, missing, swapped, or path-escaped artifact therefore fails
+        closed and can be surfaced by both the CLI and API callers.
+        """
+        failures: list[dict[str, Any]] = []
+        records = self.list_artifacts(run_id)
+        root = self.root.resolve()
+        for record in records:
+            artifact_id = str(record.get("artifact_id") or "")
+            raw_path = Path(str(record.get("path") or ""))
+            try:
+                resolved = raw_path.resolve(strict=True)
+                relative = resolved.relative_to(root)
+                # ``raw_path`` may itself be a symlink even when its resolved
+                # target remains under the root; evidence links must be
+                # stable files, not mutable indirections.
+                if raw_path.is_symlink():
+                    raise ValueError("artifact path is a symbolic link")
+                cursor = root
+                for component in relative.parts[:-1]:
+                    cursor = cursor / component
+                    if cursor.is_symlink():
+                        raise ValueError("artifact path contains a symbolic link")
+                if not resolved.is_file():
+                    raise ValueError("artifact path is not a regular file")
+                digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+                size = resolved.stat().st_size
+                if digest != record.get("sha256"):
+                    raise ValueError("artifact digest mismatch")
+                if int(record.get("size", -1)) != size:
+                    raise ValueError("artifact size mismatch")
+            except (OSError, ValueError, TypeError) as exc:
+                failures.append({"artifact_id": artifact_id, "error": str(exc)})
+        return {
+            "run_id": run_id,
+            "valid": not failures and bool(records),
+            "artifact_count": len(records),
+            "failures": failures,
+        }
+
     def write_artifact(self,run_id,kind,content:bytes,filename:str,metadata=None):
         """Write one immutable artifact and retain a run-scoped metadata link.
 

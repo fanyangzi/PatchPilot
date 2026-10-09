@@ -33,9 +33,22 @@ def run(args):
     pp=PatchPilot(args.artifacts); task=pp.load_task(args.task); result=pp.run_task(task); print(json.dumps(result.to_dict(),indent=2,ensure_ascii=False)); return 0 if result.conclusion in ('TRUSTED_DELIVERY','NEEDS_REVIEW') else 1
 
 def bundle(args):
+    from .evidence.store import EvidenceStore
+    if getattr(args, "bundle_action", None) == "check":
+        result = EvidenceStore(args.artifacts).check_artifacts(args.run_id)
+        if args.json:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        elif result["valid"]:
+            print(f'✓ Evidence bundle for {args.run_id} is valid ({result["artifact_count"]} artifacts)')
+        else:
+            print(f'✗ Evidence bundle for {args.run_id} is invalid', file=sys.stderr)
+            for failure in result["failures"]:
+                print(f'  {failure.get("artifact_id", "artifact")}: {failure.get("error", "invalid")}', file=sys.stderr)
+        return 0 if result["valid"] else 1
     p=Path(args.artifacts)/args.run_id
     if not p.exists(): print('run not found',file=sys.stderr); return 1
-    print(json.dumps({'run_id':args.run_id,'path':str(p.resolve()),'files':[str(x) for x in p.iterdir()]},indent=2)); return 0
+    files = sorted(str(x.relative_to(p)) for x in p.iterdir())
+    print(json.dumps({'run_id':args.run_id,'files':files},indent=2,ensure_ascii=False)); return 0
 
 def verify(args):
     """验证指定 run_id 的证据链完整性"""
@@ -75,7 +88,19 @@ def verify(args):
             return 1
         prev_hash = expected_hash
 
-    # 2. 验证 verdict_hash (如果存在)
+    # 2. Verify every artifact byte and path before trusting the report.
+    artifact_check = store.check_artifacts(args.run_id)
+    if not artifact_check["valid"]:
+        result = {'valid': False, 'error': 'artifact_integrity_failed', 'run_id': args.run_id, 'artifacts': artifact_check}
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            print(f'✗ Artifact integrity failed for {args.run_id}', file=sys.stderr)
+            for failure in artifact_check["failures"]:
+                print(f'  {failure.get("artifact_id", "artifact")}: {failure.get("error", "invalid")}', file=sys.stderr)
+        return 1
+
+    # 3. 验证 verdict_hash (如果存在)
     verdict_valid = True
     if run_data.get('verdict_hash'):
         # 需要重新计算 verdict_hash
@@ -115,13 +140,14 @@ def verify(args):
                 return 1
 
     result = {'valid': True, 'events_checked': len(events), 'run_id': args.run_id,
-              'verdict_hash_verified': bool(run_data.get('verdict_hash'))}
+              'verdict_hash_verified': bool(run_data.get('verdict_hash')),
+              'artifacts': artifact_check}
     if args.json:
         print(json.dumps(result))
     else:
         print(f'✓ Run {args.run_id} is valid')
         print(f'  Events checked: {len(events)}')
-        if run_data.get('verdict_hash'):
+    if run_data.get('verdict_hash'):
             print(f'  Verdict hash: {run_data["verdict_hash"][:16]}...')
     return 0
 
@@ -129,7 +155,7 @@ def main(argv=None):
     ap=argparse.ArgumentParser(prog='patchpilot'); sub=ap.add_subparsers(dest='cmd',required=True)
     d=sub.add_parser('doctor'); d.add_argument('--remote',action='store_true'); d.set_defaults(fn=doctor)
     r=sub.add_parser('run'); r.add_argument('--task',required=True); r.add_argument('--artifacts',default='artifacts'); r.add_argument('--json',action='store_true'); r.set_defaults(fn=run)
-    b=sub.add_parser('bundle'); b.add_argument('--run-id',required=True); b.add_argument('--artifacts',default='artifacts'); b.set_defaults(fn=bundle)
+    b=sub.add_parser('bundle'); b.add_argument('bundle_action', nargs='?', choices=['check']); b.add_argument('--run-id',required=True); b.add_argument('--artifacts',default='artifacts'); b.add_argument('--json',action='store_true'); b.set_defaults(fn=bundle)
     v=sub.add_parser('verify'); v.add_argument('--run-id',required=True); v.add_argument('--artifacts',default='artifacts'); v.add_argument('--json',action='store_true'); v.set_defaults(fn=verify)
     a=ap.parse_args(argv); return a.fn(a)
 if __name__=='__main__': raise SystemExit(main())
