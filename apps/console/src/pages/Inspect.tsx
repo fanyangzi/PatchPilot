@@ -109,7 +109,7 @@ function DossierShell({ runId, issueTitle, repo, commit, runtimeSec, attempts, v
 
     <section className="g-evidence-band" aria-label="证据状态">
       <div><strong>证据已封存</strong><span>本次运行的检查结果、执行轨迹和交付物已保存。</span></div>
-      <span className="g-evidence-count">{runId}</span>
+      <span className="g-evidence-count">{checks.filter((check) => check.evidence?.length).length}/6 项有原始依据 · {runId}</span>
     </section>
   </div>;
 }
@@ -119,8 +119,15 @@ function checksFromEvents(events: import('../api').RunEvent[]): CheckRow[] {
   // the final gate decision, while the run detail keeps the full history.
   const verifyEv = [...events].reverse().find(e => e.kind === 'verification');
   const raw: Record<string, boolean> = verifyEv?.data?.checks ?? {};
+  const failure = verifyEv?.data?.failure as { failure_class?: string; message?: string } | undefined;
   return CHECKS.map((def, i) => {
     const result = raw[def.key];
+    const evidenceRows: [string, string][] = [
+      ['来源事件', verifyEv ? `${verifyEv.event_id} · ${verifyEv.status || '记录'}` : '没有 verification 事件'],
+      ['原始检查值', result === undefined ? '未记录' : result ? 'true · 通过' : 'false · 未通过'],
+    ];
+    if (failure?.failure_class) evidenceRows.push(['失败分类', failure.failure_class]);
+    if (failure?.message) evidenceRows.push(['失败消息', failure.message]);
     return {
       id: String(i + 1).padStart(2, '0'),
       key: def.key,
@@ -128,6 +135,7 @@ function checksFromEvents(events: import('../api').RunEvent[]): CheckRow[] {
       state: result === false ? 'block' : result === true ? 'pass' : 'skip' as 'pass' | 'block' | 'skip',
       judgement: result === true ? def.hint : result === false ? `${def.name}未通过` : '未执行',
       basis: def.hint,
+      evidence: verifyEv ? [{ kind: 'facts', label: '可复核记录', rows: evidenceRows }] : undefined,
     };
   });
 }

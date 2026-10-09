@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, BookOpenCheck, ChartColumn, ClipboardCheck, FileText, GitPullRequest, Play, ScanSearch, Terminal } from 'lucide-react';
+import { Activity, BookOpenCheck, ChartColumn, ClipboardCheck, FileText, GitPullRequest, Play, ScanSearch, Terminal, MoreHorizontal } from 'lucide-react';
 import { api, type RunRecord } from './api';
 import { v1 } from './apiV1';
 import { useAsync, useRoute, href, go, Loading, Offline } from './ui';
@@ -18,12 +18,18 @@ import './styles/pages.css';
 import './styles/gate.css';
 import './styles/acceptance.css';
 
-const TABS = [
+const PRIMARY_TABS = [
   { page: 'inbox', name: '验收队列', icon: ClipboardCheck },
   { page: 'review', name: '代码审查', icon: GitPullRequest },
   { page: 'investigation', name: '反例调查', icon: ScanSearch },
   { page: 'contract', name: '验收条件', icon: BookOpenCheck },
   { page: 'report', name: '交付报告', icon: FileText },
+] as const;
+
+/** Legacy evidence views remain deep-linkable, but the acceptance workspace is
+ * the product's primary surface. Keeping these links out of the masthead
+ * makes the first frame read like a maintainer inbox instead of a demo menu. */
+const SECONDARY_TABS = [
   { page: 'inspect', name: '仓库体检', icon: ScanSearch },
   { page: 'overview', name: '总览', icon: ChartColumn },
   { page: 'runs', name: '运行记录', icon: Activity },
@@ -33,7 +39,8 @@ const TABS = [
 
 function App() {
   const route = useRoute();
-  const runs = useAsync(() => api.runs(), []);
+  const legacyPage = route.page === 'overview' || route.page === 'runs' || route.page === 'routing';
+  const runs = useAsync(() => legacyPage ? api.runs() : Promise.resolve([] as RunRecord[]), [legacyPage]);
   const service = useAsync(() => v1.health(), []);
   const [dialog, setDialog] = useState(false);
   const [intakeDialog, setIntakeDialog] = useState(false);
@@ -57,9 +64,17 @@ function App() {
         </span>
       </a>
       <nav className="tabs" aria-label="主导航">
-        {TABS.map((t) => <a key={t.page} href={href({ page: t.page })} className={route.page === t.page ? 'tab on' : 'tab'} aria-current={route.page === t.page ? 'page' : undefined}>
+        {PRIMARY_TABS.map((t) => <a key={t.page} href={href({ page: t.page })} className={route.page === t.page ? 'tab on' : 'tab'} aria-current={route.page === t.page ? 'page' : undefined}>
           <t.icon size={15} />{t.name}
         </a>)}
+        <details className="tab-more">
+          <summary className={SECONDARY_TABS.some((t) => route.page === t.page) ? 'tab on' : 'tab'}><MoreHorizontal size={15} />证据工具</summary>
+          <div className="tab-more-menu" role="menu">
+            {SECONDARY_TABS.map((t) => <a key={t.page} href={href({ page: t.page })} role="menuitem" className={route.page === t.page ? 'on' : undefined}>
+              <t.icon size={14} />{t.name}
+            </a>)}
+          </div>
+        </details>
       </nav>
       <div className="topbar-end">
         <span className={`conn ${online ? 'conn-on' : 'conn-off'}`}>
@@ -72,7 +87,7 @@ function App() {
     <main className="page" id="main">
       {route.page === 'inspect' && <InspectPage />}
       {route.page === 'policy' && <PolicyPage />}
-      {route.page === 'inbox' && <AcceptanceInboxPage routeId={route.id} />}
+      {route.page === 'inbox' && <AcceptanceInboxPage routeId={route.id} onImport={() => setIntakeDialog(true)} />}
       {route.page === 'review' && <CodeReviewPage routeId={route.id} candidateId={route.candidateId} contractId={route.contractId} checkId={route.checkId} />}
       {route.page === 'investigation' && <CounterexamplePage routeId={route.id} candidateId={route.candidateId} />}
       {route.page === 'contract' && <AcceptanceContractPage routeId={route.id} contractId={route.contractId} />}

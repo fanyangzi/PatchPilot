@@ -42,7 +42,7 @@ button, input, select { font: inherit; color: inherit; }
 .brand-name { font-weight: 600; font-size: var(--t-md); letter-spacing: .01em; }
 .brand-sub { color: #8593AA; font-size: var(--t-2xs); letter-spacing: .04em; }
 
-.tabs { display: flex; gap: 2px; height: 100%; }
+.tabs { display: flex; gap: 2px; height: 100%; min-width: 0; }
 .tab {
   display: flex; align-items: center; gap: 7px; padding: 0 13px;
   text-decoration: none; color: #9DAABF; font-size: var(--t-sm);
@@ -50,6 +50,24 @@ button, input, select { font: inherit; color: inherit; }
 }
 .tab:hover { color: #E8EDF5; }
 .tab.on { color: #fff; font-weight: 500; border-bottom-color: #fff; }
+
+/* The acceptance workspace owns the masthead. Evidence views are still
+ * reachable, but live behind a small disclosure so the first frame stays
+ * focused on real intake and maintainer decisions. */
+.tab-more { position: relative; height: 100%; }
+.tab-more > summary { list-style: none; cursor: pointer; }
+.tab-more > summary::-webkit-details-marker { display: none; }
+.tab-more[open] > summary { color: #fff; border-bottom-color: #fff; }
+.tab-more-menu {
+  position: absolute; z-index: 40; top: calc(100% - 1px); right: 0; min-width: 168px;
+  display: grid; padding: 6px; background: var(--ink-slab); border: 1px solid rgba(255,255,255,.18);
+  border-top-color: rgba(255,255,255,.35);
+}
+.tab-more-menu a {
+  display: flex; align-items: center; gap: 8px; padding: 9px 10px; color: #AAB6C8;
+  text-decoration: none; font-size: var(--t-xs); white-space: nowrap;
+}
+.tab-more-menu a:hover, .tab-more-menu a.on { color: #fff; background: #1B2A42; }
 
 .topbar-end { margin-left: auto; display: flex; align-items: center; gap: 14px; }
 .conn { display: flex; align-items: center; gap: 7px; font-size: var(--t-xs); color: #8593AA; }
@@ -186,4 +204,22 @@ button, input, select { font: inherit; color: inherit; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+@media (max-width: 940px) {
+  .topbar { gap: 14px; padding-left: 16px; padding-right: 16px; }
+  .brand-sub { display: none; }
+  .tab { padding: 0 9px; }
+  .topbar-end .conn { display: none; }
+}
+
+@media (max-width: 680px) {
+  .topbar { height: auto; min-height: var(--top); flex-wrap: wrap; padding-top: 8px; padding-bottom: 0; }
+  .tabs { order: 3; width: 100%; height: 42px; overflow-x: auto; }
+  .tab { height: 42px; padding: 0 10px; font-size: var(--t-xs); }
+  .tab-more { height: 42px; }
+  .tab-more-menu { position: fixed; top: 102px; right: 12px; }
+  .topbar-end { margin-left: auto; }
+  .topbar-end .btn { height: 31px; padding: 0 9px; font-size: var(--t-xs); }
+  .page { padding: 24px 16px 80px; }
 }

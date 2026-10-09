@@ -85,13 +85,26 @@ function fourStatus(verification?: Verification | null) {
   return <div className="ac-four"><Status label="运行状态" value={verification.run_state} tone={stateTone(verification.run_state)} /><Status label="结论" value={verification.verdict} tone={stateTone(verification.verdict)} /><Status label="有效性" value={verification.validity} tone={stateTone(verification.validity)} /><Status label="维护者决策" value={verification.review_decision} tone={stateTone(verification.review_decision)} /></div>;
 }
 
-export function AcceptanceInboxPage({ routeId }: { routeId?: string }) {
+export function AcceptanceInboxPage({ routeId, onImport }: { routeId?: string; onImport?: () => void }) {
   const inbox = useRemote('inbox', () => v1.inbox());
   const rows = inbox.data?.items || [];
+  const hasActiveWork = rows.some((row) => {
+    const state = row.verification?.run_state || row.latest_verification?.run_state || row.status;
+    return state === 'queued' || state === 'running' || state === 'pending';
+  });
+  // Verification workers are intentionally asynchronous. Refresh only while
+  // a task is active so the queue reflects the measured state without turning
+  // an idle inbox into a polling dashboard.
+  useEffect(() => {
+    if (!hasActiveWork || inbox.loading || inbox.error) return;
+    const timer = window.setInterval(inbox.reload, 3000);
+    return () => window.clearInterval(timer);
+  }, [hasActiveWork, inbox.loading, inbox.error, inbox.reload]);
   return <div className="ac-page">
     <PageHead eyebrow="MAINTAINER INBOX / 01" title="验收队列" lead="维护者待决策入口。每一项都来自持久化任务、候选、验收合同和验证记录。" icon={ClipboardCheck} action={<button className="btn" onClick={inbox.reload}><RefreshCw size={14} />刷新队列</button>} />
-    <div className="ac-metrics"><div><span>队列记录</span><strong>{inbox.loading ? '…' : inbox.error ? '—' : inbox.data?.total ?? rows.length}</strong></div><div><span>展示来源</span><strong>API v1</strong></div><div><span>决策原则</span><strong>证据优先</strong></div></div>
+    <div className="ac-metrics"><div><span>队列记录</span><strong>{inbox.loading ? '…' : inbox.error ? '—' : inbox.data?.total ?? rows.length}</strong></div><div><span>展示来源</span><strong>API v1</strong></div><div><span>队列状态</span><strong className={hasActiveWork ? 'ac-metric-live' : undefined}>{hasActiveWork ? '有任务执行中' : '等待真实导入'}</strong></div></div>
     <RemoteState loading={inbox.loading} error={inbox.error} empty={!inbox.loading && !inbox.error && rows.length === 0 ? '当前没有任务进入维护者验收队列。新建真实 PR、Issue 或补丁任务后会显示在这里。' : undefined} onRetry={inbox.reload} />
+    {!inbox.loading && !inbox.error && rows.length === 0 && <div className="ac-empty-action"><div><strong>从真实候选开始</strong><p>导入仓库、基线、需求和 unified diff，系统会先建立可追溯任务，再由维护者决定何时执行验证。</p></div><button className="btn btn-primary" onClick={onImport}><Plus size={14} />导入真实任务</button></div>}
     {!inbox.loading && !inbox.error && rows.length > 0 && <div className="ac-table-wrap"><table className="ac-table"><thead><tr><th>问题 / 仓库</th><th>候选补丁</th><th>合同</th><th>四维状态</th><th>下一步</th><th /></tr></thead><tbody>{rows.map((row, i) => {
       const task = row.task || ({ task_id: row.task_id, issue_snapshot: { title: row.title, repo_id: row.repo, mode: row.mode }, source_refs: row.source_refs, mode: row.mode, revision: 1, created_at: row.created_at } as Task);
       const candidate = row.candidate;
