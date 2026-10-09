@@ -8,12 +8,12 @@ version = "0.1.0"
 description = "Policy-constrained AI maintenance runtime for open-source repositories"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["PyYAML>=6.0"]
 
 [project.optional-dependencies]
 remote = ["httpx>=0.27", "pydantic>=2", "python-dotenv>=1"]
 api = ["fastapi>=0.110", "uvicorn>=0.29"]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "httpx2>=2.13"]
 
 [project.scripts]
 patchpilot = "patchpilot.cli:main"
