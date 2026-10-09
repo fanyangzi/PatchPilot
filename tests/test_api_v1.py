@@ -85,6 +85,34 @@ def test_v1_only_lists_durable_tasks_and_creates_real_local_patch_candidate(api_
     assert client.get(f"/api/v1/candidates/{candidate['candidate_id']}/diff").json()["content"] == patch
 
 
+def test_task_graph_exposes_provenance_and_supports_focus(api_client):
+    client, _ = api_client
+    task = _create_task(client)
+    patch = "--- a.txt\n+++ b.txt\n"
+    candidate = client.post(f"/api/v1/tasks/{task['task_id']}/candidates", json={
+        "source": "upload", "base_sha": "base-sha", "patch_text": patch,
+    }).json()["candidate"]
+    draft = client.post(f"/api/v1/tasks/{task['task_id']}/contracts/draft", json={
+        "source_ids": ["issue:graph#body"], "base_snapshot_id": "snapshot-base",
+        "model_profile": "manual", "conditions": [{
+            "condition_id": "AC-GRAPH", "kind": "change", "statement": "Keep the patch reviewable",
+            "source_refs": ["issue:graph#body"], "required": True,
+            "oracle": {"type": "example", "expected": "ok"},
+        }],
+    }).json()["contract"]
+    frozen = client.post(f"/api/v1/contracts/{draft['contract_id']}/freeze", json={
+        "expected_revision": 1, "confirmed_condition_ids": ["AC-GRAPH"],
+    }).json()["contract"]
+    graph = client.get(f"/api/v1/tasks/{task['task_id']}/graph").json()
+    assert graph["task_id"] == task["task_id"]
+    assert {node["type"] for node in graph["nodes"]} >= {"task", "source", "candidate", "contract", "condition"}
+    assert any(edge["source"] == f"task:{task['task_id']}" and edge["target"] == f"candidate:{candidate['candidate_id']}" for edge in graph["edges"])
+    focused = client.get(f"/api/v1/tasks/{task['task_id']}/graph", params={"focus": candidate["candidate_id"], "depth": 1}).json()
+    assert focused["focus"] == f"candidate:{candidate['candidate_id']}"
+    assert all(node["id"].startswith(("task:", "candidate:", "verification:")) for node in focused["nodes"])
+    assert client.get(f"/api/v1/tasks/{task['task_id']}/graph", params={"focus": "missing-node"}).status_code == 404
+
+
 def test_probe_plan_is_bounded_and_does_not_claim_evidence(api_client):
     client, _ = api_client
     task = _create_task(client)

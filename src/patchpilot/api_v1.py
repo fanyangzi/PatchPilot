@@ -51,6 +51,7 @@ from .domain.entities import (
     Verdict,
     compute_verification_key,
     normalized_argv_digest,
+    thaw_json,
     utc_now,
 )
 from .application.verification_service import (
@@ -1012,6 +1013,190 @@ def _verification_dict(store, verification: Verification) -> dict[str, Any]:
     return data
 
 
+def _graph_source_id(source_ref: str) -> str:
+    """Return a stable, bounded identifier for an external source reference."""
+    digest = hashlib.sha256(source_ref.encode("utf-8")).hexdigest()[:20]
+    return f"source:{digest}"
+
+
+def _graph_node(node_id: str, node_type: str, label: str, status: str,
+                *, refs: list[str] | tuple[str, ...] = (), meta: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Build the small, UI-safe node projection used by the EvidenceGraph API."""
+    return {
+        "id": node_id,
+        "type": node_type,
+        "label": label,
+        "status": status,
+        "refs": list(dict.fromkeys(str(ref) for ref in refs if ref)),
+        "meta": dict(meta or {}),
+    }
+
+
+def _graph_edge(source: str, target: str, edge_type: str, label: str = "") -> dict[str, Any]:
+    digest = hashlib.sha256(f"{source}\x00{target}\x00{edge_type}".encode("utf-8")).hexdigest()[:20]
+    return {"id": f"edge:{digest}", "source": source, "target": target, "type": edge_type, "label": label}
+
+
+def _task_graph(store, task: Task) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Materialize a read-only provenance graph from immutable v1 records.
+
+    The graph is deliberately assembled from the durable entities rather than
+    from UI state.  Missing execution/check/finding rows therefore remain
+    absent and cannot be mistaken for successful evidence.
+    """
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    node_ids: set[str] = set()
+    edge_keys: set[tuple[str, str, str]] = set()
+
+    def add_node(node: dict[str, Any]) -> str:
+        if node["id"] not in node_ids:
+            node_ids.add(node["id"])
+            nodes.append(node)
+        return node["id"]
+
+    def add_edge(source: str, target: str, edge_type: str, label: str = "") -> None:
+        if source not in node_ids or target not in node_ids:
+            return
+        key = (source, target, edge_type)
+        if key not in edge_keys:
+            edge_keys.add(key)
+            edges.append(_graph_edge(source, target, edge_type, label))
+
+    task_id = f"task:{task.task_id}"
+    issue = task.issue_snapshot
+    add_node(_graph_node(
+        task_id, "task", str(issue.get("title") or task.task_id), "draft",
+        refs=task.source_refs,
+        meta={"task_id": task.task_id, "mode": task.mode, "revision": task.revision,
+              "repo_id": issue.get("repo_id"), "base_ref": issue.get("base_ref")},
+    ))
+
+    # Sources are content-addressed in the graph so arbitrary URLs/text never
+    # become DOM identifiers.  The human-readable reference remains in meta.
+    source_nodes: dict[str, str] = {}
+
+    def add_source(source_ref: str, owner_id: str) -> None:
+        source_ref = str(source_ref)
+        source_id = source_nodes.get(source_ref)
+        if source_id is None:
+            source_id = _graph_source_id(source_ref)
+            source_nodes[source_ref] = source_id
+            add_node(_graph_node(source_id, "source", source_ref, "linked", refs=[source_ref], meta={"ref": source_ref}))
+        add_edge(owner_id, source_id, "cites", "source")
+
+    for source_ref in task.source_refs:
+        add_source(source_ref, task_id)
+
+    candidates = store.list_candidates(task.task_id)
+    contracts = store.list_contract_versions(task.task_id)
+    verifications = [verification for candidate in candidates for verification in store.list_verifications(candidate.candidate_id)]
+    # Derivation is idempotent and only creates findings for measured rows; a
+    # queued verification with no checks remains graphically incomplete.
+    findings = store.ensure_findings_for_task(task.task_id)
+
+    for candidate in candidates:
+        candidate_id = f"candidate:{candidate.candidate_id}"
+        add_node(_graph_node(
+            candidate_id, "candidate", candidate.candidate_id, "available",
+            meta={"candidate_id": candidate.candidate_id, "base_sha": candidate.base_sha,
+                  "head_sha": candidate.head_sha, "tree_digest": candidate.tree_digest,
+                  "patch_hash": candidate.patch_hash, "author_type": candidate.author_type,
+                  "parent_candidate_id": candidate.parent_candidate_id},
+        ))
+        add_edge(task_id, candidate_id, "contains", "candidate")
+    for candidate in candidates:
+        if candidate.parent_candidate_id:
+            parent_id = f"candidate:{candidate.parent_candidate_id}"
+            # Parent candidates are guaranteed by EvidenceStore; adding these
+            # edges in a second pass keeps ordering independent of timestamps.
+            add_edge(parent_id, f"candidate:{candidate.candidate_id}", "derived_from", "repair")
+
+    for contract in contracts:
+        contract_id = f"contract:{contract.contract_id}@{contract.revision}"
+        add_node(_graph_node(
+            contract_id, "contract", f"Contract {contract.contract_id} · r{contract.revision}", contract.state.value,
+            refs=contract.source_refs,
+            meta={"contract_id": contract.contract_id, "revision": contract.revision,
+                  "state": contract.state.value, "contract_hash": contract.contract_hash},
+        ))
+        add_edge(task_id, contract_id, "contains", "contract")
+        for source_ref in contract.source_refs:
+            add_source(source_ref, contract_id)
+        for condition in contract.conditions:
+            condition_id = f"condition:{contract.contract_id}@{contract.revision}:{condition.condition_id}"
+            condition_status = condition.confirmation or ("required" if condition.required else "optional")
+            add_node(_graph_node(
+                condition_id, "condition", condition.statement, condition_status,
+                refs=condition.source_refs,
+                meta={"condition_id": condition.condition_id, "contract_id": contract.contract_id,
+                      "revision": contract.revision, "kind": condition.kind,
+                      "required": condition.required, "confirmation": condition.confirmation,
+                      "oracle": thaw_json(condition.oracle)},
+            ))
+            add_edge(contract_id, condition_id, "defines", "condition")
+            for source_ref in condition.source_refs:
+                add_source(source_ref, condition_id)
+
+    for verification in verifications:
+        verification_id = f"verification:{verification.verification_id}"
+        add_node(_graph_node(
+            verification_id, "verification", verification.verification_id, verification.run_state.value,
+            refs=[verification.verification_key],
+            meta={"verification_id": verification.verification_id, "verification_key": verification.verification_key,
+                  "candidate_id": verification.candidate_id, "contract_id": verification.contract_id,
+                  "contract_revision": verification.contract_revision, "run_state": verification.run_state.value,
+                  "verdict": verification.verdict.value, "validity": verification.validity.value,
+                  "review_decision": verification.review_decision.value, "gaps": list(verification.gaps),
+                  "completed_checks": list(verification.completed_checks)},
+        ))
+        add_edge(f"candidate:{verification.candidate_id}", verification_id, "verified", "verification")
+        add_edge(f"contract:{verification.contract_id}@{verification.contract_revision}", verification_id, "evaluates", "contract")
+        for check in store.list_check_executions(verification.verification_id):
+            check_id = f"check:{check.check_id}"
+            add_node(_graph_node(
+                check_id, "check", f"{check.suite_id} · {check.variant}", check.outcome.value,
+                refs=check.artifact_refs,
+                meta={"check_id": check.check_id, "verification_id": check.verification_id,
+                      "suite_id": check.suite_id, "target": check.target, "variant": check.variant,
+                      "outcome": check.outcome.value, "count": check.count, "return_code": check.return_code,
+                      "duration_ms": check.duration_ms, "command_argv": list(check.command_argv),
+                      "details": thaw_json(check.details)},
+            ))
+            add_edge(verification_id, check_id, "measured", check.variant)
+            for artifact_ref in check.artifact_refs:
+                artifact_id = f"artifact:{artifact_ref}"
+                add_node(_graph_node(artifact_id, "artifact", str(artifact_ref), "sealed", refs=[str(artifact_ref)], meta={"artifact_id": artifact_ref}))
+                add_edge(check_id, artifact_id, "produced", "artifact")
+
+    for finding in findings:
+        finding_id = f"finding:{finding.finding_id}"
+        add_node(_graph_node(
+            finding_id, "finding", finding.title, finding.status,
+            refs=tuple(finding.evidence_refs) + tuple(finding.check_ids),
+            meta={"finding_id": finding.finding_id, "verification_id": finding.verification_id,
+                  "candidate_id": finding.candidate_id, "contract_id": finding.contract_id,
+                  "contract_revision": finding.contract_revision, "kind": finding.kind,
+                  "status": finding.status, "message": finding.message, "condition_id": finding.condition_id,
+                  "input_hash": finding.input_hash, "expected_basis": finding.expected_basis,
+                  "source_variant": finding.source_variant, "check_ids": list(finding.check_ids),
+                  "evidence_refs": list(finding.evidence_refs), "repeats": finding.repeats,
+                  "details": thaw_json(finding.details)},
+        ))
+        add_edge(f"verification:{finding.verification_id}", finding_id, "observed", "finding")
+        if finding.condition_id:
+            condition_id = f"condition:{finding.contract_id}@{finding.contract_revision}:{finding.condition_id}"
+            add_edge(condition_id, finding_id, "assesses", "condition")
+        for check_id in finding.check_ids:
+            add_edge(f"check:{check_id}", finding_id, "supports", "check")
+        for evidence_ref in finding.evidence_refs:
+            artifact_id = f"artifact:{evidence_ref}"
+            if artifact_id in node_ids:
+                add_edge(artifact_id, finding_id, "supports", "evidence")
+
+    return nodes, edges
+
+
 @router.get("/health")
 def v1_health(request: Request):
     return _result(request, {"status": "ok", "service": "patchpilot-api", "api_version": "v1", "python": platform.python_version()})
@@ -1439,6 +1624,106 @@ def get_task(task_id: str, request: Request):
         verifications.extend(store.list_verifications(candidate.candidate_id))
     latest = _verification_dict(store, verifications[-1]) if verifications else None
     return _result(request, {"task": _task_dict(task), "candidates": candidates, "contracts": contracts, "latest_verification": latest})
+
+
+@router.get("/tasks/{task_id}/graph")
+def get_task_graph(
+    task_id: str,
+    request: Request,
+    focus: str | None = None,
+    depth: int = 2,
+    limit: int = 200,
+):
+    """Return a bounded, read-only local EvidenceGraph for one task.
+
+    ``focus`` accepts either a returned node id (for example
+    ``verification:...``) or an underlying resource id.  Traversal is
+    undirected so a focused finding can reveal the check and contract source
+    that support it without exposing unrelated tasks.  Graph construction is
+    restricted to records owned by the task and is therefore safe to use as a
+    review-studio data source.
+    """
+    if depth < 0 or depth > 4:
+        raise APIError(422, "invalid_graph_depth", "depth must be between 0 and 4")
+    if limit < 1 or limit > 500:
+        raise APIError(422, "invalid_graph_limit", "limit must be between 1 and 500")
+    store = _evidence_store()
+    task = store.get_task(task_id)
+    if not task:
+        raise APIError(404, "task_not_found", "task does not exist or is not visible")
+    nodes, edges = _task_graph(store, task)
+    all_node_ids = {node["id"] for node in nodes}
+
+    resolved_focus: str | None = None
+    if focus:
+        raw_focus = str(focus)
+        if raw_focus in all_node_ids:
+            resolved_focus = raw_focus
+        else:
+            # Resource ids are convenient for deep links from the matrix and
+            # findings table.  Match metadata exactly before a suffix fallback
+            # to avoid accidentally selecting a similarly named source.
+            for node in nodes:
+                meta = node.get("meta") or {}
+                values = {str(value) for key, value in meta.items() if key.endswith("_id") or key in {"ref", "artifact_id"} and value}
+                if raw_focus in values:
+                    resolved_focus = node["id"]
+                    break
+            if resolved_focus is None:
+                matches = [node["id"] for node in nodes if node["id"].endswith(f":{raw_focus}")]
+                if len(matches) == 1:
+                    resolved_focus = matches[0]
+        if resolved_focus is None:
+            raise APIError(404, "graph_focus_not_found", "focus does not identify a node in this task")
+
+    selected_ids = all_node_ids
+    truncated = False
+    if resolved_focus is not None:
+        adjacency: dict[str, set[str]] = {node_id: set() for node_id in all_node_ids}
+        for edge in edges:
+            adjacency.setdefault(edge["source"], set()).add(edge["target"])
+            adjacency.setdefault(edge["target"], set()).add(edge["source"])
+        selected_ids = {resolved_focus}
+        frontier = {resolved_focus}
+        for _ in range(depth):
+            next_frontier = {neighbor for item in frontier for neighbor in adjacency.get(item, set())} - selected_ids
+            selected_ids.update(next_frontier)
+            frontier = next_frontier
+            if not frontier:
+                break
+
+    # Keep the task root and focused node visible under a small limit.  The
+    # stable node insertion order is task -> sources -> candidates -> contracts
+    # -> executions, which makes pagination deterministic for the UI.
+    ordered_nodes = [node for node in nodes if node["id"] in selected_ids]
+    if len(ordered_nodes) > limit:
+        keep_ids: list[str] = []
+        for preferred in (f"task:{task_id}", resolved_focus):
+            if preferred and preferred in selected_ids and preferred not in keep_ids:
+                keep_ids.append(preferred)
+        for node in ordered_nodes:
+            if node["id"] not in keep_ids:
+                keep_ids.append(node["id"])
+            if len(keep_ids) >= limit:
+                break
+        selected_ids = set(keep_ids)
+        ordered_nodes = [node for node in ordered_nodes if node["id"] in selected_ids]
+        truncated = True
+    selected_edges = [edge for edge in edges if edge["source"] in selected_ids and edge["target"] in selected_ids]
+    counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    for node in ordered_nodes:
+        counts[node["type"]] = counts.get(node["type"], 0) + 1
+        status_counts[node["status"]] = status_counts.get(node["status"], 0) + 1
+    return _result(request, {
+        "task_id": task_id,
+        "focus": resolved_focus,
+        "depth": depth,
+        "nodes": ordered_nodes,
+        "edges": selected_edges,
+        "summary": {"node_count": len(ordered_nodes), "edge_count": len(selected_edges), "counts": counts, "status_counts": status_counts},
+        "truncated": truncated,
+    })
 
 
 @router.post("/tasks/{task_id}/contracts/draft", status_code=202)
